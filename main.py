@@ -26,6 +26,22 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN      = os.getenv("BOT_TOKEN", "8767537310:AAHK1-RmvgH6yF6ZShQFq3A1DeLU0uFsAMs")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "1LCmoydfS73DKwjQcwMSnpOZxRHiKMAMjOZRRk0AwYnE")
 ADMIN_CHAT_ID  = int(os.getenv("ADMIN_CHAT_ID", "-5486975908"))
+
+# Отделы сотрудников (tg_id -> отдел)
+DEPARTMENTS = {
+    "7070230704":  "Руководство",
+    "7198542902":  "Руководство",
+    "8151347813":  "Продажи",
+    "195676845":   "Маркетинг",
+    "8069881891":  "Бухгалтерия",
+    "458764300":   "Производство и дизайн",
+    "860192861":   "Производство и дизайн",
+    "89555212":    "Производство и дизайн",
+    "549232571":   "Маркетинг",
+}
+
+def get_dept(tg_id) -> str:
+    return DEPARTMENTS.get(str(tg_id), "Без отдела")
 TZ             = ZoneInfo("Europe/Moscow")
 APZ            = pytz.timezone("Europe/Moscow")
 
@@ -550,95 +566,364 @@ async def job_ping_deadlines(bot: Bot):
                 parse_mode="HTML")
         except Exception as ex: logger.warning(f"ping_today: {ex}")
 
-# ── CALLBACK BUTTONS ─────────────────────────────────────────────────────────
-async def cb_show_all_tasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+# ── HELPER FUNCTIONS ─────────────────────────────────────────────────────────
+def fmt_dl(deadline: str) -> str:
+    if not deadline: return "—"
+    return deadline[8:]+"."+deadline[5:7]+"."+deadline[:4]
+
+def is_admin_check(query) -> bool:
+    if not emp_is_admin(query.from_user.id):
+        return False
+    return True
+
+def tasks_for_date(target_date: str) -> list:
+    """Задачи с дедлайном на конкретную дату."""
+    return [t for t in tasks_all() if t.get("deadline","") == target_date and t["status"] != "done"]
+
+def tasks_for_period(date_from: str, date_to: str) -> list:
+    """Задачи за период."""
+    return [t for t in tasks_all()
+            if t.get("deadline","") >= date_from and t.get("deadline","") <= date_to]
+
+def reports_for_period(date_from: str, date_to: str) -> list:
+    ws = sheet("reports"); ensure_headers(ws, RH)
+    return [r for r in ws.get_all_records()
+            if r.get("date","") >= date_from and r.get("date","") <= date_to]
+
+def plans_for_period(date_from: str, date_to: str) -> list:
+    ws = sheet("plans"); ensure_headers(ws, PH)
+    return [p for p in ws.get_all_records()
+            if p.get("date","") >= date_from and p.get("date","") <= date_to]
+
+def back_keyboard():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="back_main")]])
+
+
+# ── CALLBACK HANDLERS ─────────────────────────────────────────────────────────
+async def cb_back_main(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if not emp_is_admin(query.from_user.id):
-        await query.answer("⛔ Только для руководителей.", show_alert=True)
-        return
-    open_t = tasks_open()
-    over_t = tasks_overdue()
-    if not open_t and not over_t:
-        await query.message.reply_text("✅ Нет активных задач!")
-        return
-    lines = [f"📋 <b>Все задачи команды ({len(open_t)} активных):</b>\n"]
-    if over_t:
-        lines.append("<b>🔴 Просроченные:</b>")
-        for t in over_t:
-            dl = t["deadline"]; dl_fmt = dl[8:]+"."+dl[5:7]+"."+dl[:4] if dl else "—"
-            lines.append(f"  🔴 <code>{t['task_id']}</code> <b>{t['assigned_to_name']}</b>: {t['title']} (срок {dl_fmt})")
+    await query.message.reply_text("Выбери действие:", reply_markup=build_admin_keyboard())
+
+
+async def cb_tasks_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Все активные задачи с дедлайном сегодня."""
+    query = update.callback_query
+    await query.answer()
+    if not is_admin_check(query):
+        await query.answer("⛔ Только для руководителей.", show_alert=True); return
+    today = date.today().strftime("%Y-%m-%d")
+    today_fmt = date.today().strftime("%d.%m.%Y")
+    tasks = tasks_for_date(today)
+    over = [t for t in tasks_overdue() if t not in tasks]
+
+    lines = [f"📋 <b>Задачи на сегодня ({today_fmt}):</b>\n"]
+    if not tasks and not over:
+        lines.append("✅ Нет задач на сегодня!")
+    if over:
+        lines.append(f"🔴 <b>Просроченные ({len(over)}):</b>")
+        for t in over:
+            lines.append(f"  🔴 <code>{t['task_id']}</code> {t['assigned_to_name']}: {t['title']} (срок {fmt_dl(t['deadline'])})")
         lines.append("")
-    active = [t for t in open_t if t not in over_t]
-    if active:
-        lines.append("<b>🔵 Активные:</b>")
-        for t in active:
-            dl = t["deadline"]; dl_fmt = dl[8:]+"."+dl[5:7]+"."+dl[:4] if dl else "—"
-            lines.append(f"  🔵 <code>{t['task_id']}</code> <b>{t['assigned_to_name']}</b>: {t['title']} — до {dl_fmt}")
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("🔄 Обновить", callback_data="show_all_tasks")
-    ]])
+    if tasks:
+        lines.append(f"🔵 <b>На сегодня ({len(tasks)}):</b>")
+        for t in tasks:
+            src = " <i>(из плана)</i>" if t.get("comment") == "из плана" else ""
+            lines.append(f"  🔵 <code>{t['task_id']}</code> {t['assigned_to_name']}: {t['title']}{src}")
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Обновить", callback_data="tasks_today")],
+        [InlineKeyboardButton("◀️ Назад", callback_data="back_main")],
+    ])
     await query.message.reply_text("\n".join(lines), parse_mode="HTML", reply_markup=keyboard)
 
 
-async def cb_show_team_summary(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def cb_show_all_tasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Все активные задачи команды."""
     query = update.callback_query
     await query.answer()
-    if not emp_is_admin(query.from_user.id):
-        await query.answer("⛔ Только для руководителей.", show_alert=True)
-        return
+    if not is_admin_check(query):
+        await query.answer("⛔ Только для руководителей.", show_alert=True); return
+    open_t = tasks_open()
+    over_t = tasks_overdue()
+    lines = [f"📋 <b>Все активные задачи ({len(open_t)}):</b>\n"]
+    if not open_t:
+        lines.append("✅ Нет активных задач!")
+    else:
+        # группируем по отделу
+        by_dept: dict[str, list] = {}
+        for t in open_t:
+            dept = get_dept(t["assigned_to_id"])
+            by_dept.setdefault(dept, []).append(t)
+        for dept, dt_list in sorted(by_dept.items()):
+            lines.append(f"<b>— {dept} —</b>")
+            for t in dt_list:
+                icon = "🔴" if t in over_t else "🔵"
+                src = " <i>(план)</i>" if t.get("comment") == "из плана" else ""
+                lines.append(f"  {icon} <code>{t['task_id']}</code> {t['assigned_to_name']}: {t['title']} — до {fmt_dl(t['deadline'])}{src}")
+            lines.append("")
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Обновить", callback_data="show_all_tasks")],
+        [InlineKeyboardButton("◀️ Назад", callback_data="back_main")],
+    ])
+    await query.message.reply_text("\n".join(lines), parse_mode="HTML", reply_markup=keyboard)
+
+
+async def cb_summary_depts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Сводка по отделам за сегодня."""
+    query = update.callback_query
+    await query.answer()
+    if not is_admin_check(query):
+        await query.answer("⛔ Только для руководителей.", show_alert=True); return
     employees = emp_employees()
     plan_ids   = {str(p["tg_id"]) for p in plans_today()}
     report_ids = {str(r["tg_id"]) for r in reports_today()}
     all_t = tasks_all()
-    lines = [f"📊 <b>Сводка команды на {datetime.now().strftime('%d.%m.%Y')}:</b>\n"]
+    today = date.today().strftime("%Y-%m-%d")
+    today_fmt = date.today().strftime("%d.%m.%Y")
+
+    # группируем по отделам
+    dept_employees: dict[str, list] = {}
+    for e in employees:
+        dept = get_dept(e["tg_id"])
+        dept_employees.setdefault(dept, []).append(e)
+
+    lines = [f"📊 <b>Сводка по отделам — {today_fmt}</b>\n"]
+    for dept, emps in sorted(dept_employees.items()):
+        submitted = sum(1 for e in emps if str(e["tg_id"]) in report_ids)
+        planned   = sum(1 for e in emps if str(e["tg_id"]) in plan_ids)
+        overdue_c = sum(1 for t in all_t
+                        if get_dept(t["assigned_to_id"]) == dept
+                        and t["status"] != "done" and t.get("deadline","") < today)
+        icon = "✅" if submitted == len(emps) else ("🟡" if submitted > 0 else "🔴")
+        lines.append(f"{icon} <b>{dept}</b> ({len(emps)} чел.)")
+        lines.append(f"  планов {planned}/{len(emps)}  отчётов {submitted}/{len(emps)}"
+                     + (f"  ⚠️просрочено {overdue_c}" if overdue_c else ""))
+        for e in emps:
+            tid = str(e["tg_id"])
+            p = "✅" if tid in plan_ids else "❌"
+            r = "✅" if tid in report_ids else "—"
+            lines.append(f"    {e['full_name']}  план {p}  отчёт {r}")
+        lines.append("")
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("👤 По сотруднику", callback_data="summary_person_list")],
+        [InlineKeyboardButton("◀️ Назад", callback_data="back_main")],
+    ])
+    await query.message.reply_text("\n".join(lines), parse_mode="HTML", reply_markup=keyboard)
+
+
+async def cb_summary_person_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Список сотрудников для выбора."""
+    query = update.callback_query
+    await query.answer()
+    if not is_admin_check(query):
+        await query.answer("⛔ Только для руководителей.", show_alert=True); return
+    employees = emp_employees()
+    buttons = []
+    row = []
+    for i, e in enumerate(employees):
+        row.append(InlineKeyboardButton(
+            e["full_name"].split()[0],
+            callback_data=f"person_{e['tg_id']}"
+        ))
+        if len(row) == 2:
+            buttons.append(row); row = []
+    if row: buttons.append(row)
+    buttons.append([InlineKeyboardButton("◀️ Назад", callback_data="back_main")])
+    await query.message.reply_text("Выбери сотрудника:", reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def cb_summary_person(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Детальная сводка по конкретному сотруднику."""
+    query = update.callback_query
+    await query.answer()
+    if not is_admin_check(query):
+        await query.answer("⛔ Только для руководителей.", show_alert=True); return
+    tg_id = query.data.split("_", 1)[1]
+    emp = emp_by_id(int(tg_id))
+    if not emp:
+        await query.message.reply_text("Сотрудник не найден."); return
+
+    today = date.today().strftime("%Y-%m-%d")
+    today_fmt = date.today().strftime("%d.%m.%Y")
+    plan_ids   = {str(p["tg_id"]) for p in plans_today()}
+    report_ids = {str(r["tg_id"]) for r in reports_today()}
+    all_t = tasks_all()
+
+    emp_tasks = [t for t in all_t if str(t["assigned_to_id"]) == tg_id and t["status"] != "done"]
+    done_today = [t for t in all_t if str(t["assigned_to_id"]) == tg_id
+                  and t["status"] == "done" and t.get("done_at","").startswith(today)]
+    overdue = [t for t in emp_tasks if t.get("deadline","") < today]
+
+    has_plan   = tg_id in plan_ids
+    has_report = tg_id in report_ids
+
+    lines = [
+        f"👤 <b>{emp['full_name']}</b>",
+        f"Отдел: {get_dept(tg_id)}",
+        f"Сегодня {today_fmt}:",
+        f"  план {'✅' if has_plan else '❌'}  отчёт {'✅' if has_report else '❌'}\n",
+    ]
+    if emp_tasks:
+        lines.append(f"<b>Активные задачи ({len(emp_tasks)}):</b>")
+        for t in emp_tasks:
+            icon = "🔴" if t in overdue else "🔵"
+            src = " <i>(план)</i>" if t.get("comment") == "из плана" else ""
+            lines.append(f"  {icon} {t['title']} — до {fmt_dl(t['deadline'])}{src}")
+    if done_today:
+        lines.append(f"\n<b>Выполнено сегодня ({len(done_today)}):</b>")
+        for t in done_today:
+            lines.append(f"  ✅ {t['title']}")
+    if not emp_tasks and not done_today:
+        lines.append("Нет задач.")
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("👥 Другой сотрудник", callback_data="summary_person_list")],
+        [InlineKeyboardButton("◀️ Назад", callback_data="back_main")],
+    ])
+    await query.message.reply_text("\n".join(lines), parse_mode="HTML", reply_markup=keyboard)
+
+
+async def cb_period_week(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Сводка за текущую неделю."""
+    query = update.callback_query
+    await query.answer()
+    if not is_admin_check(query):
+        await query.answer("⛔ Только для руководителей.", show_alert=True); return
+    today = date.today()
+    week_start = (today - timedelta(days=today.weekday())).strftime("%Y-%m-%d")
+    week_end   = today.strftime("%Y-%m-%d")
+    week_start_fmt = (today - timedelta(days=today.weekday())).strftime("%d.%m")
+    week_end_fmt   = today.strftime("%d.%m.%Y")
+
+    employees  = emp_employees()
+    reps       = reports_for_period(week_start, week_end)
+    plans_w    = plans_for_period(week_start, week_end)
+    all_t      = tasks_all()
+    done_w     = [t for t in all_t if t["status"] == "done"
+                  and t.get("done_at","")[:10] >= week_start]
+    over       = tasks_overdue()
+
+    lines = [
+        f"📅 <b>Сводка за неделю ({week_start_fmt} — {week_end_fmt})</b>\n",
+        f"Сотрудников: {len(employees)}",
+        f"Уникальных отчётов: {len(set(r['tg_id'] for r in reps))} / {len(employees)}",
+        f"Задач выполнено: {len(done_w)}",
+        f"Просроченных сейчас: {len(over)}\n",
+        "<b>По сотрудникам:</b>",
+    ]
     for e in employees:
         tid = str(e["tg_id"])
-        active = sum(1 for t in all_t if str(t["assigned_to_id"])==tid and t["status"]!="done")
-        over   = sum(1 for t in all_t if str(t["assigned_to_id"])==tid and t["status"]!="done"
-                     and t.get("deadline","") and t["deadline"] < datetime.now().strftime("%Y-%m-%d"))
-        p_icon = "✅" if tid in plan_ids else "❌"
-        r_icon = "✅" if tid in report_ids else "❌"
-        over_str = f"  ⚠️просрочено: {over}" if over else ""
-        lines.append(
-            f"<b>{e['full_name']}</b>\n"
-            f"  план {p_icon}  отчёт {r_icon}  "
-            f"задач активных: {active}{over_str}"
-        )
-    await query.message.reply_text("\n".join(lines), parse_mode="HTML")
+        r_c = sum(1 for r in reps if str(r["tg_id"]) == tid)
+        d_c = sum(1 for t in done_w if str(t["assigned_to_id"]) == tid)
+        o_c = sum(1 for t in over if str(t["assigned_to_id"]) == tid)
+        icon = "✅" if r_c >= 4 else ("🟡" if r_c >= 1 else "🔴")
+        lines.append(f"{icon} <b>{e['full_name']}</b> ({get_dept(e['tg_id'])}): "
+                     f"отчётов {r_c}, задач ✅ {d_c}" + (f", ⚠️ {o_c}" if o_c else ""))
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📅 За месяц", callback_data="period_month")],
+        [InlineKeyboardButton("◀️ Назад", callback_data="back_main")],
+    ])
+    await query.message.reply_text("\n".join(lines), parse_mode="HTML", reply_markup=keyboard)
+
+
+async def cb_period_month(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Сводка за текущий месяц."""
+    query = update.callback_query
+    await query.answer()
+    if not is_admin_check(query):
+        await query.answer("⛔ Только для руководителей.", show_alert=True); return
+    today = date.today()
+    month_start = today.replace(day=1).strftime("%Y-%m-%d")
+    month_end   = today.strftime("%Y-%m-%d")
+    month_label = today.strftime("%B %Y")
+
+    import calendar
+    _, last = calendar.monthrange(today.year, today.month)
+    wd = sum(1 for d in range(1, today.day+1)
+             if date(today.year, today.month, d).weekday() < 5)
+
+    employees = emp_employees()
+    reps      = reports_for_period(month_start, month_end)
+    all_t     = tasks_all()
+    done_m    = [t for t in all_t if t["status"] == "done"
+                 and t.get("done_at","")[:10] >= month_start]
+    over      = tasks_overdue()
+
+    lines = [
+        f"📆 <b>Сводка за {month_label}</b>\n",
+        f"Рабочих дней прошло: {wd}",
+        f"Задач выполнено: {len(done_m)}",
+        f"Просроченных: {len(over)}\n",
+        "<b>По сотрудникам:</b>",
+    ]
+    for e in employees:
+        tid = str(e["tg_id"])
+        r_c = sum(1 for r in reps if str(r["tg_id"]) == tid)
+        d_c = sum(1 for t in done_m if str(t["assigned_to_id"]) == tid)
+        pct = round(r_c / max(wd, 1) * 100)
+        icon = "✅" if pct >= 80 else ("🟡" if pct >= 40 else "🔴")
+        lines.append(f"{icon} <b>{e['full_name']}</b> ({get_dept(e['tg_id'])}): "
+                     f"отчётов {r_c}/{wd} ({pct}%), задач ✅ {d_c}")
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📅 За неделю", callback_data="period_week")],
+        [InlineKeyboardButton("◀️ Назад", callback_data="back_main")],
+    ])
+    await query.message.reply_text("\n".join(lines), parse_mode="HTML", reply_markup=keyboard)
+
+
+def build_admin_keyboard():
+    """Главная клавиатура для группы руководителей."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📋 Задачи сегодня", callback_data="tasks_today"),
+            InlineKeyboardButton("📋 Все активные", callback_data="show_all_tasks"),
+        ],
+        [
+            InlineKeyboardButton("📊 Сводка по отделам", callback_data="summary_depts"),
+            InlineKeyboardButton("👤 По сотруднику", callback_data="summary_person_list"),
+        ],
+        [
+            InlineKeyboardButton("📅 Период: неделя", callback_data="period_week"),
+            InlineKeyboardButton("📅 Период: месяц", callback_data="period_month"),
+        ],
+    ])
 
 
 async def job_daily_digest(bot: Bot):
     today = datetime.now().strftime("%d.%m.%Y")
     employees = emp_employees()
     p_list = plans_today(); r_list = reports_today()
-    plan_map   = {str(p["tg_id"]): p["plan_text"] for p in p_list}
-    report_map = {str(r["tg_id"]): r["report_text"] for r in r_list}
-    lines = [f"📊 <b>Сводка за {today}</b>",
-             f"Отчётов: {len(r_list)}/{len(employees)}\n"]
-    for e in employees:
-        tid = str(e["tg_id"]); name = e["full_name"]
-        if tid in report_map:
-            lines.append(f"✅ <b>{name}</b>")
-            if tid in plan_map: lines.append(f"  📋 {plan_map[tid][:200]}")
-            lines.append(f"  📝 {report_map[tid][:300]}")
-        elif tid in plan_map:
-            lines.append(f"🟡 <b>{name}</b> — план есть, отчёт не сдан\n  📋 {plan_map[tid][:200]}")
-        else:
-            lines.append(f"❌ <b>{name}</b> — ни плана, ни отчёта")
-        lines.append("")
+    plan_ids   = {str(p["tg_id"]) for p in p_list}
+    report_ids = {str(r["tg_id"]) for r in r_list}
+
+    submitted = len(report_ids)
+    total = len(employees)
+    no_plan   = [e["full_name"] for e in employees if str(e["tg_id"]) not in plan_ids]
+    no_report = [e["full_name"] for e in employees if str(e["tg_id"]) not in report_ids]
     over = tasks_overdue()
+
+    lines = [
+        f"📊 <b>Ежедневная сводка — {today}</b>",
+        f"Планов: {len(plan_ids)}/{total}   Отчётов: {submitted}/{total}\n",
+    ]
+    if no_plan:
+        lines.append(f"❌ <b>Не сдали план:</b> {', '.join(no_plan)}")
+    if no_report:
+        lines.append(f"❌ <b>Не сдали отчёт:</b> {', '.join(no_report)}")
     if over:
-        lines.append(f"⚠️ <b>Просроченные задачи ({len(over)}):</b>")
-        for t in over[:5]:
-            lines.append(f"  🔴 {t['assigned_to_name']}: {t['title']} (срок {t['deadline']})")
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("📋 Все задачи команды", callback_data="show_all_tasks"),
-        InlineKeyboardButton("📊 По сотрудникам", callback_data="show_team_summary"),
-    ]])
+        lines.append(f"\n⚠️ <b>Просроченных задач: {len(over)}</b>")
+        for t in over[:3]:
+            lines.append(f"  🔴 {t['assigned_to_name']}: {t['title']}")
+        if len(over) > 3:
+            lines.append(f"  ...и ещё {len(over)-3}")
+
     try:
         await bot.send_message(ADMIN_CHAT_ID, "\n".join(lines),
-                               parse_mode="HTML", reply_markup=keyboard)
+                               parse_mode="HTML", reply_markup=build_admin_keyboard())
     except Exception as ex: logger.warning(f"daily_digest: {ex}")
 
 async def job_weekly_audit(bot: Bot):
@@ -768,8 +1053,14 @@ def main():
     app.add_handler(CommandHandler("setadmin",  cmd_setadmin))
     app.add_handler(CommandHandler("team",      cmd_team))
     app.add_handler(CommandHandler("tasks_all", cmd_tasks_all))
-    app.add_handler(CallbackQueryHandler(cb_show_all_tasks,    pattern="^show_all_tasks$"))
-    app.add_handler(CallbackQueryHandler(cb_show_team_summary, pattern="^show_team_summary$"))
+    app.add_handler(CallbackQueryHandler(cb_back_main,            pattern="^back_main$"))
+    app.add_handler(CallbackQueryHandler(cb_tasks_today,           pattern="^tasks_today$"))
+    app.add_handler(CallbackQueryHandler(cb_show_all_tasks,        pattern="^show_all_tasks$"))
+    app.add_handler(CallbackQueryHandler(cb_summary_depts,         pattern="^summary_depts$"))
+    app.add_handler(CallbackQueryHandler(cb_summary_person_list,   pattern="^summary_person_list$"))
+    app.add_handler(CallbackQueryHandler(cb_summary_person,        pattern="^person_"))
+    app.add_handler(CallbackQueryHandler(cb_period_week,           pattern="^period_week$"))
+    app.add_handler(CallbackQueryHandler(cb_period_month,          pattern="^period_month$"))
 
     logger.info("Bot starting...")
     app.run_polling(drop_pending_updates=True)
