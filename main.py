@@ -10,10 +10,10 @@ from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
 from google.oauth2.service_account import Credentials
 
-from telegram import Update, Bot
+from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
-    ConversationHandler, ContextTypes, filters
+    ConversationHandler, ContextTypes, filters, CallbackQueryHandler
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -264,11 +264,66 @@ async def cmd_plan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"📋 {u['full_name']}, напиши план на сегодня:")
     return S_PLAN
 
+def parse_plan_items(text: str) -> list[str]:
+    """Разбирает текст плана на отдельные задачи."""
+    items = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # убираем маркеры списков: 1. 2. / - / • / ✅ / 🪡 / 💘 / 🩵 и т.п.
+        line = re.sub(r"^[\d]+[\.\)]\s*", "", line)          # 1. 1)
+        line = re.sub(r"^[-–—•*]\s*", "", line)               # - • *
+        line = re.sub(r"^[✅🪡💘🩵🔜👌📌⚡️✔️▪️▸►→]\s*", "", line)  # эмодзи-маркеры
+        line = line.strip()
+        if len(line) > 3:   # игнорируем слишком короткие строки
+            items.append(line)
+    return items
+
+
 async def recv_plan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     tg_id = update.effective_user.id
     u = emp_by_id(tg_id)
-    save_plan(tg_id, u["full_name"], update.message.text.strip())
-    await update.message.reply_text("✅ План записан! Увидимся в 19:00 🌆")
+    text = update.message.text.strip()
+    today = date.today().strftime("%Y-%m-%d")
+
+    # сохраняем полный текст плана
+    save_plan(tg_id, u["full_name"], text)
+
+    # удаляем старые задачи из плана на сегодня (если сотрудник переписал план)
+    ws = tasks_sheet()
+    all_rows = ws.get_all_records()
+    rows_to_delete = []
+    for i, r in enumerate(all_rows, start=2):
+        if (str(r["assigned_to_id"]) == str(tg_id)
+                and r.get("created_at", "").startswith(today)
+                and r.get("comment", "") == "из плана"):
+            rows_to_delete.append(i)
+    # удаляем снизу вверх чтобы не сбивать индексы
+    for row_i in sorted(rows_to_delete, reverse=True):
+        ws.delete_rows(row_i)
+
+    # создаём задачи из пунктов плана
+    items = parse_plan_items(text)
+    created = []
+    for item in items:
+        tid = str(uuid.uuid4())[:8].upper()
+        ws.append_row([
+            tid, tg_id, u["full_name"],
+            tg_id, u["full_name"],   # назначена себе
+            item, today, "open",
+            datetime.now().strftime("%Y-%m-%d %H:%M"), "", "из плана"
+        ])
+        created.append(item)
+
+    if created:
+        task_list = "\n".join(f"  • {t}" for t in created)
+        await update.message.reply_text(
+            f"✅ План записан! Создано {len(created)} задач на сегодня:\n{task_list}\n\n"
+            f"Увидимся в 19:00 🌆\n/mytasks — посмотреть свои задачи"
+        )
+    else:
+        await update.message.reply_text("✅ План записан! Увидимся в 19:00 🌆")
     return ConversationHandler.END
 
 # ── /report ───────────────────────────────────────────────────────────────────
@@ -495,6 +550,64 @@ async def job_ping_deadlines(bot: Bot):
                 parse_mode="HTML")
         except Exception as ex: logger.warning(f"ping_today: {ex}")
 
+# ── CALLBACK BUTTONS ─────────────────────────────────────────────────────────
+async def cb_show_all_tasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not emp_is_admin(query.from_user.id):
+        await query.answer("⛔ Только для руководителей.", show_alert=True)
+        return
+    open_t = tasks_open()
+    over_t = tasks_overdue()
+    if not open_t and not over_t:
+        await query.message.reply_text("✅ Нет активных задач!")
+        return
+    lines = [f"📋 <b>Все задачи команды ({len(open_t)} активных):</b>\n"]
+    if over_t:
+        lines.append("<b>🔴 Просроченные:</b>")
+        for t in over_t:
+            dl = t["deadline"]; dl_fmt = dl[8:]+"."+dl[5:7]+"."+dl[:4] if dl else "—"
+            lines.append(f"  🔴 <code>{t['task_id']}</code> <b>{t['assigned_to_name']}</b>: {t['title']} (срок {dl_fmt})")
+        lines.append("")
+    active = [t for t in open_t if t not in over_t]
+    if active:
+        lines.append("<b>🔵 Активные:</b>")
+        for t in active:
+            dl = t["deadline"]; dl_fmt = dl[8:]+"."+dl[5:7]+"."+dl[:4] if dl else "—"
+            lines.append(f"  🔵 <code>{t['task_id']}</code> <b>{t['assigned_to_name']}</b>: {t['title']} — до {dl_fmt}")
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔄 Обновить", callback_data="show_all_tasks")
+    ]])
+    await query.message.reply_text("\n".join(lines), parse_mode="HTML", reply_markup=keyboard)
+
+
+async def cb_show_team_summary(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not emp_is_admin(query.from_user.id):
+        await query.answer("⛔ Только для руководителей.", show_alert=True)
+        return
+    employees = emp_employees()
+    plan_ids   = {str(p["tg_id"]) for p in plans_today()}
+    report_ids = {str(r["tg_id"]) for r in reports_today()}
+    all_t = tasks_all()
+    lines = [f"📊 <b>Сводка команды на {datetime.now().strftime('%d.%m.%Y')}:</b>\n"]
+    for e in employees:
+        tid = str(e["tg_id"])
+        active = sum(1 for t in all_t if str(t["assigned_to_id"])==tid and t["status"]!="done")
+        over   = sum(1 for t in all_t if str(t["assigned_to_id"])==tid and t["status"]!="done"
+                     and t.get("deadline","") and t["deadline"] < datetime.now().strftime("%Y-%m-%d"))
+        p_icon = "✅" if tid in plan_ids else "❌"
+        r_icon = "✅" if tid in report_ids else "❌"
+        over_str = f"  ⚠️просрочено: {over}" if over else ""
+        lines.append(
+            f"<b>{e['full_name']}</b>\n"
+            f"  план {p_icon}  отчёт {r_icon}  "
+            f"задач активных: {active}{over_str}"
+        )
+    await query.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
 async def job_daily_digest(bot: Bot):
     today = datetime.now().strftime("%d.%m.%Y")
     employees = emp_employees()
@@ -519,8 +632,13 @@ async def job_daily_digest(bot: Bot):
         lines.append(f"⚠️ <b>Просроченные задачи ({len(over)}):</b>")
         for t in over[:5]:
             lines.append(f"  🔴 {t['assigned_to_name']}: {t['title']} (срок {t['deadline']})")
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("📋 Все задачи команды", callback_data="show_all_tasks"),
+        InlineKeyboardButton("📊 По сотрудникам", callback_data="show_team_summary"),
+    ]])
     try:
-        await bot.send_message(ADMIN_CHAT_ID, "\n".join(lines), parse_mode="HTML")
+        await bot.send_message(ADMIN_CHAT_ID, "\n".join(lines),
+                               parse_mode="HTML", reply_markup=keyboard)
     except Exception as ex: logger.warning(f"daily_digest: {ex}")
 
 async def job_weekly_audit(bot: Bot):
@@ -650,6 +768,8 @@ def main():
     app.add_handler(CommandHandler("setadmin",  cmd_setadmin))
     app.add_handler(CommandHandler("team",      cmd_team))
     app.add_handler(CommandHandler("tasks_all", cmd_tasks_all))
+    app.add_handler(CallbackQueryHandler(cb_show_all_tasks,    pattern="^show_all_tasks$"))
+    app.add_handler(CallbackQueryHandler(cb_show_team_summary, pattern="^show_team_summary$"))
 
     logger.info("Bot starting...")
     app.run_polling(drop_pending_updates=True)
