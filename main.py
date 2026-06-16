@@ -466,6 +466,33 @@ async def cmd_mytasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 # ── ADMIN ─────────────────────────────────────────────────────────────────────
+async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Панель управления для руководителей — работает в группе и в личке."""
+    tg_id = update.effective_user.id
+    if not emp_is_admin(tg_id):
+        await update.effective_message.reply_text("⛔ Только для руководителей.")
+        return
+    today = date.today().strftime("%d.%m.%Y")
+    employees = emp_employees()
+    plan_ids   = {str(p["tg_id"]) for p in plans_today()}
+    report_ids = {str(r["tg_id"]) for r in reports_today()}
+    submitted  = len(report_ids)
+    total      = len(employees)
+    over       = tasks_overdue()
+    open_t     = tasks_open()
+
+    text = (
+        f"🎛 <b>Панель управления — {today}</b>\n\n"
+        f"📋 Планов: {len(plan_ids)}/{total}\n"
+        f"📝 Отчётов: {submitted}/{total}\n"
+        f"✅ Задач активных: {len(open_t)}\n"
+        + (f"⚠️ Просроченных: {len(over)}\n" if over else "")
+    )
+    await update.effective_message.reply_text(
+        text, parse_mode="HTML", reply_markup=build_admin_keyboard()
+    )
+
+
 async def cmd_makeadmin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     tg_id = update.effective_user.id
     if not emp_registered(tg_id):
@@ -1018,6 +1045,7 @@ async def post_init(app):
         ("status",    "Статус: /status ID"),
         ("team",      "Сводка команды (руководители)"),
         ("tasks_all", "Все задачи (руководители)"),
+        ("menu",      "Панель управления с кнопками (руководители)"),
         ("makeadmin", "Стать администратором (первый запуск)"),
     ])
 
@@ -1049,6 +1077,7 @@ def main():
     app.add_handler(CommandHandler("done",      cmd_done))
     app.add_handler(CommandHandler("status",    cmd_status))
     app.add_handler(CommandHandler("mytasks",   cmd_mytasks))
+    app.add_handler(CommandHandler("menu",      cmd_menu))
     app.add_handler(CommandHandler("makeadmin", cmd_makeadmin))
     app.add_handler(CommandHandler("setadmin",  cmd_setadmin))
     app.add_handler(CommandHandler("team",      cmd_team))
