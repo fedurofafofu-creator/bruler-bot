@@ -4,6 +4,7 @@ import json
 import uuid
 import re
 import io
+import time
 import pytz
 import gspread
 import calendar
@@ -97,6 +98,9 @@ def get_dept(tg_id) -> str:
 # ── GOOGLE SHEETS ─────────────────────────────────────────────────────────────
 _gc = None
 _ss = None
+_ws_cache = {}        # name -> Worksheet object, кэшируется навсегда (объект не меняется)
+_data_cache = {}       # name -> (timestamp, rows), короткий TTL чтобы не дёргать API на каждый вызов
+DATA_CACHE_TTL = 8     # секунд — этого достаточно чтобы пережить серию из 5-6 команд подряд
 
 def gc():
     global _gc
@@ -118,10 +122,23 @@ def ss():
     return _ss
 
 def sheet(name):
+    """Кэширует объект Worksheet — избегает повторного fetch_sheet_metadata
+    при каждом вызове (это отдельный API-запрос, который быстро съедает квоту)."""
+    if name in _ws_cache:
+        return _ws_cache[name]
     try:
-        return ss().worksheet(name)
+        ws = ss().worksheet(name)
     except gspread.WorksheetNotFound:
-        return ss().add_worksheet(title=name, rows=2000, cols=20)
+        ws = ss().add_worksheet(title=name, rows=2000, cols=20)
+    _ws_cache[name] = ws
+    return ws
+
+def invalidate_cache(name=None):
+    """Сбрасывает кэш данных после любой записи, чтобы следующее чтение было свежим."""
+    if name:
+        _data_cache.pop(name, None)
+    else:
+        _data_cache.clear()
 
 def ensure_headers(ws, headers):
     """Гарантирует корректный, не дублирующийся заголовок в первой строке."""
@@ -131,21 +148,53 @@ def ensure_headers(ws, headers):
         ws.update('A1', [headers])
 
 def safe_records(ws, headers):
-    """get_all_records, устойчивый к повреждённому заголовку."""
-    ensure_headers(ws, headers)
-    try:
-        return ws.get_all_records(expected_headers=headers)
-    except Exception:
-        # fallback: читаем вручную по индексам колонок
-        all_values = ws.get_all_values()
-        if len(all_values) < 2:
-            return []
-        rows = all_values[1:]
-        result = []
-        for row in rows:
-            row = row + [""] * (len(headers) - len(row))
-            result.append({headers[i]: row[i] for i in range(len(headers))})
-        return result
+    """
+    Читает данные листа вручную по позиции колонки, без gspread.get_all_records().
+    Устойчиво к повреждённому заголовку и расхождению числа колонок после миграции схемы.
+    Кэширует результат на DATA_CACHE_TTL секунд — несколько команд подряд от одного
+    или разных пользователей переиспользуют один и тот же снимок данных, что резко
+    снижает число запросов к Google Sheets API и защищает от 429 Quota exceeded.
+    При срабатывании квоты делает 2 повторные попытки с задержкой; если квота всё
+    ещё превышена — отдаёт последний известный кэш (даже просроченный), а не падает.
+    """
+    cache_key = ws.title
+    cached = _data_cache.get(cache_key)
+    if cached and (datetime.now() - cached[0]).total_seconds() < DATA_CACHE_TTL:
+        return cached[1]
+
+    last_error = None
+    for attempt in range(3):
+        try:
+            ensure_headers(ws, headers)
+            all_values = ws.get_all_values()
+            n = len(headers)
+            result = []
+            if len(all_values) >= 2:
+                for row in all_values[1:]:
+                    if len(row) < n:
+                        row = row + [""] * (n - len(row))
+                    elif len(row) > n:
+                        row = row[:n]
+                    result.append({headers[i]: row[i] for i in range(n)})
+            _data_cache[cache_key] = (datetime.now(), result)
+            return result
+        except gspread.exceptions.APIError as e:
+            last_error = e
+            if "429" in str(e) or "Quota exceeded" in str(e):
+                # Блокирующий sleep здесь осознанно: это редкий аварийный путь
+                # (квота превышена), а не штатный режим — благодаря кэшу выше
+                # обычные обращения сюда вообще не доходят.
+                time.sleep(2 * (attempt + 1))
+                continue
+            raise
+
+    # квота не отпустила за 3 попытки — отдаём устаревший кэш, если он есть,
+    # лучше показать чуть старые данные чем уронить команду полностью
+    if cached:
+        logger.warning(f"Sheets quota exceeded for {cache_key}, serving stale cache")
+        return cached[1]
+    logger.error(f"Sheets quota exceeded for {cache_key}, no cache available")
+    raise last_error
 
 # ── EMPLOYEES ─────────────────────────────────────────────────────────────────
 EMP_H = ["tg_id","username","full_name","role","registered_at","department"]
@@ -203,6 +252,7 @@ def emp_register(tg_id, username, full_name, role="employee", department=""):
         return False
     emp_sheet().append_row([tg_id, username or "", full_name, role,
                              datetime.now().strftime("%Y-%m-%d %H:%M"), department])
+    invalidate_cache("employees")
     return True
 
 def emp_set_admin(tg_id):
@@ -210,6 +260,7 @@ def emp_set_admin(tg_id):
     for i, r in enumerate(safe_records(ws, EMP_H), start=2):
         if str(r["tg_id"]) == str(tg_id):
             ws.update_cell(i, EMP_H.index("role") + 1, "admin")
+            invalidate_cache("employees")
             return True
     return False
 
@@ -218,6 +269,7 @@ def emp_set_role(tg_id, role: str):
     for i, r in enumerate(safe_records(ws, EMP_H), start=2):
         if str(r["tg_id"]) == str(tg_id):
             ws.update_cell(i, EMP_H.index("role") + 1, role)
+            invalidate_cache("employees")
             return True
     return False
 
@@ -226,6 +278,7 @@ def emp_set_department(tg_id, department: str):
     for i, r in enumerate(safe_records(ws, EMP_H), start=2):
         if str(r["tg_id"]) == str(tg_id):
             ws.update_cell(i, EMP_H.index("department") + 1, department)
+            invalidate_cache("employees")
             return True
     return False
 
@@ -234,6 +287,7 @@ def emp_set_full_name(tg_id, full_name: str):
     for i, r in enumerate(safe_records(ws, EMP_H), start=2):
         if str(r["tg_id"]) == str(tg_id):
             ws.update_cell(i, EMP_H.index("full_name") + 1, full_name)
+            invalidate_cache("employees")
             return True
     return False
 
@@ -252,10 +306,12 @@ def today_str():
 def save_plan(tg_id, name, text):
     plans_sheet().append_row([today_str(), tg_id, name, text,
                                datetime.now().strftime("%Y-%m-%d %H:%M")])
+    invalidate_cache("plans")
 
 def save_report(tg_id, name, text):
     reports_sheet().append_row([today_str(), tg_id, name, text,
                                  datetime.now().strftime("%Y-%m-%d %H:%M")])
+    invalidate_cache("reports")
 
 def plans_today():
     return [r for r in safe_records(plans_sheet(), PH) if r["date"] == today_str()]
@@ -350,12 +406,14 @@ def task_create(by_id, by_name, to_id, to_name, title, deadline, source="manual"
         deadline, "open", datetime.now().strftime("%Y-%m-%d %H:%M"),
         "", "", "", source, channel
     ])
+    invalidate_cache("tasks")
     return tid
 
 def task_update_channel(tid, channel: str):
     row = task_find_row(tid)
     if not row: return False
     tasks_sheet().update_cell(row, TH.index("channel") + 1, channel)
+    invalidate_cache("tasks")
     return True
 
 def task_update_status(tid, status):
@@ -365,6 +423,7 @@ def task_update_status(tid, status):
     ws.update_cell(row, TH.index("status") + 1, status)
     if status == "done":
         ws.update_cell(row, TH.index("done_at") + 1, datetime.now().strftime("%Y-%m-%d %H:%M"))
+    invalidate_cache("tasks")
     return True
 
 def task_update_comment(tid, comment, link=""):
@@ -374,18 +433,21 @@ def task_update_comment(tid, comment, link=""):
     ws.update_cell(row, TH.index("comment") + 1, comment)
     if link:
         ws.update_cell(row, TH.index("result_link") + 1, link)
+    invalidate_cache("tasks")
     return True
 
 def task_update_title(tid, title: str):
     row = task_find_row(tid)
     if not row: return False
     tasks_sheet().update_cell(row, TH.index("title") + 1, title)
+    invalidate_cache("tasks")
     return True
 
 def task_update_deadline(tid, deadline: str):
     row = task_find_row(tid)
     if not row: return False
     tasks_sheet().update_cell(row, TH.index("deadline") + 1, deadline)
+    invalidate_cache("tasks")
     return True
 
 def tasks_today_for_user(tg_id):
@@ -603,6 +665,8 @@ async def recv_plan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                  and r.get("source","") == "plan"]
     for row_i in sorted(to_delete, reverse=True):
         ws.delete_rows(row_i)
+    if to_delete:
+        invalidate_cache("tasks")
 
     # создаём задачи из плана
     items = parse_plan_items(text)
