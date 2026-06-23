@@ -1279,7 +1279,7 @@ async def cmd_mytasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         src = " <i>(план)</i>" if t.get("source") == "plan" else ""
         tag = f" 🏷{t['channel']}" if t.get("channel") else ""
         lines.append(f"{sl.get(t['status'],'⚪')} <code>{t['task_id']}</code> {t['title']} — до {dl_fmt}{src}{tag}")
-    await update.effective_message.reply_text("\n".join(lines), parse_mode="HTML")
+    await reply_long_text(update.effective_message, lines, parse_mode="HTML")
 
 # ── ADMIN KEYBOARD ────────────────────────────────────────────────────────────
 def build_admin_keyboard():
@@ -1312,6 +1312,56 @@ def build_admin_keyboard():
 def fmt_dl(deadline: str) -> str:
     if not deadline: return "—"
     return deadline[8:]+"."+deadline[5:7]+"."+deadline[:4]
+
+TELEGRAM_MAX_LEN = 4000  # с запасом от реального лимита 4096
+
+def split_lines_to_chunks(lines: list, max_len: int = TELEGRAM_MAX_LEN) -> list:
+    """
+    Группирует список строк в чанки, каждый не длиннее max_len символов
+    (с учётом переводов строк), чтобы не упереться в лимит Telegram на
+    длину одного сообщения ("Message is too long").
+    """
+    chunks = []
+    current = []
+    current_len = 0
+    for line in lines:
+        line_len = len(line) + 1  # +1 за \n
+        if current_len + line_len > max_len and current:
+            chunks.append(current)
+            current = []
+            current_len = 0
+        current.append(line)
+        current_len += line_len
+    if current:
+        chunks.append(current)
+    return chunks or [[""]]
+
+async def reply_long_text(message, lines: list, parse_mode="HTML", reply_markup=None):
+    """
+    Отправляет список строк, разбивая на несколько сообщений если суммарный
+    текст превышает лимит Telegram. Кнопки (reply_markup) ставятся только
+    под последним сообщением.
+    """
+    chunks = split_lines_to_chunks(lines)
+    for i, chunk in enumerate(chunks):
+        is_last = (i == len(chunks) - 1)
+        await message.reply_text(
+            "\n".join(chunk),
+            parse_mode=parse_mode,
+            reply_markup=reply_markup if is_last else None
+        )
+
+async def send_long_text(bot, chat_id, lines: list, parse_mode="HTML", reply_markup=None):
+    """Аналог reply_long_text для рассылок по chat_id (фоновые задания, дайджесты)."""
+    chunks = split_lines_to_chunks(lines)
+    for i, chunk in enumerate(chunks):
+        is_last = (i == len(chunks) - 1)
+        await bot.send_message(
+            chat_id,
+            "\n".join(chunk),
+            parse_mode=parse_mode,
+            reply_markup=reply_markup if is_last else None
+        )
 
 def is_admin_check(query) -> bool:
     return emp_has_management_access(query.from_user.id)
@@ -1544,7 +1594,7 @@ async def cmd_team(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"{'✅' if tid in report_ids else '❌'} <b>{e['full_name']}</b>  "
             f"план {'✅' if tid in plan_ids else '❌'}  отчёт {'✅' if tid in report_ids else '—'}"
         )
-    await update.effective_message.reply_text("\n".join(lines), parse_mode="HTML")
+    await reply_long_text(update.effective_message, lines, parse_mode="HTML")
 
 async def cmd_tasks_all(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     tg_id = update.effective_user.id
@@ -1571,7 +1621,7 @@ async def cmd_tasks_all(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             src = " <i>(план)</i>" if t.get("source") == "plan" else ""
             lines.append(f"  {icon} <code>{t['task_id']}</code> {t['assigned_to_name']}: {t['title']}{src}")
         lines.append("")
-    await update.effective_message.reply_text("\n".join(lines), parse_mode="HTML")
+    await reply_long_text(update.effective_message, lines, parse_mode="HTML")
 
 async def cmd_checkstatuses(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Запросить статусы по текущим задачам у всей команды (или своего отдела) прямо сейчас."""
@@ -1672,7 +1722,7 @@ async def cmd_recovertasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     for person, cnt in sorted(by_person.items()):
         lines.append(f"  {person}: +{cnt}")
     lines.append(f"\nЗатронутые даты: {', '.join(affected_dates)}")
-    await update.effective_message.reply_text("\n".join(lines), parse_mode="HTML")
+    await reply_long_text(update.effective_message, lines, parse_mode="HTML")
 
     # отправляем уведомление всем администраторам (в т.ч. инициатору, если он не получил выше)
     notify = (
@@ -1765,7 +1815,7 @@ async def cb_recover_run(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("📨 Запросить статусы сейчас", callback_data="checkstatuses_now")
     ]])
-    await query.message.reply_text("\n".join(lines), parse_mode="HTML", reply_markup=keyboard)
+    await reply_long_text(query.message, lines, parse_mode="HTML", reply_markup=keyboard)
 
     # уведомляем остальных администраторов
     notify = (
@@ -1797,23 +1847,28 @@ async def cb_tasks_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lines = [f"📋 <b>Задачи на сегодня{dept_label} ({today_fmt}):</b>\n"]
     if not tasks and not over:
         lines.append("✅ Нет задач на сегодня!")
+    SHOW_LIMIT = 30
     if over:
         lines.append(f"🔴 <b>Просроченные ({len(over)}):</b>")
-        for t in over:
+        for t in over[:SHOW_LIMIT]:
             lines.append(f"  🔴 <code>{t['task_id']}</code> {t['assigned_to_name']}: {t['title']} (срок {fmt_dl(t['deadline'])})")
+        if len(over) > SHOW_LIMIT:
+            lines.append(f"  … и ещё {len(over)-SHOW_LIMIT}. Используй 📥 Экспорт отдела для полного списка.")
         lines.append("")
     if tasks:
         lines.append(f"🔵 <b>На сегодня ({len(tasks)}):</b>")
-        for t in tasks:
+        for t in tasks[:SHOW_LIMIT]:
             src = " <i>(план)</i>" if t.get("source") == "plan" else ""
             sl = {"open":"⬜","in_progress":"🔄","paused":"⏸","done":"✅"}
             icon = sl.get(t["status"],"🔵")
             lines.append(f"  {icon} <code>{t['task_id']}</code> {t['assigned_to_name']}: {t['title']}{src}")
+        if len(tasks) > SHOW_LIMIT:
+            lines.append(f"  … и ещё {len(tasks)-SHOW_LIMIT}. Используй 📥 Экспорт отдела для полного списка.")
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("🔄 Обновить", callback_data="tasks_today")],
         [InlineKeyboardButton("◀️ Назад", callback_data="back_main")],
     ])
-    await query.message.reply_text("\n".join(lines), parse_mode="HTML", reply_markup=keyboard)
+    await reply_long_text(query.message, lines, parse_mode="HTML", reply_markup=keyboard)
 
 async def cb_show_all_tasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
@@ -1843,7 +1898,7 @@ async def cb_show_all_tasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🔄 Обновить", callback_data="show_all_tasks")],
         [InlineKeyboardButton("◀️ Назад", callback_data="back_main")],
     ])
-    await query.message.reply_text("\n".join(lines), parse_mode="HTML", reply_markup=keyboard)
+    await reply_long_text(query.message, lines, parse_mode="HTML", reply_markup=keyboard)
 
 async def cb_summary_depts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
@@ -1880,7 +1935,7 @@ async def cb_summary_depts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("👤 По сотруднику", callback_data="summary_person_list")],
         [InlineKeyboardButton("◀️ Назад", callback_data="back_main")],
     ])
-    await query.message.reply_text("\n".join(lines), parse_mode="HTML", reply_markup=keyboard)
+    await reply_long_text(query.message, lines, parse_mode="HTML", reply_markup=keyboard)
 
 async def cb_summary_person_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
@@ -1938,7 +1993,7 @@ async def cb_summary_person(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("👥 Другой", callback_data="summary_person_list")],
         [InlineKeyboardButton("◀️ Назад", callback_data="back_main")],
     ])
-    await query.message.reply_text("\n".join(lines), parse_mode="HTML", reply_markup=keyboard)
+    await reply_long_text(query.message, lines, parse_mode="HTML", reply_markup=keyboard)
 
 async def cb_period_week(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
@@ -1980,7 +2035,7 @@ async def cb_period_week(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📅 За месяц", callback_data="period_month")],
         [InlineKeyboardButton("◀️ Назад",    callback_data="back_main")],
     ])
-    await query.message.reply_text("\n".join(lines), parse_mode="HTML", reply_markup=keyboard)
+    await reply_long_text(query.message, lines, parse_mode="HTML", reply_markup=keyboard)
 
 async def cb_period_month(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
@@ -2023,7 +2078,7 @@ async def cb_period_month(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📅 За неделю", callback_data="period_week")],
         [InlineKeyboardButton("◀️ Назад",     callback_data="back_main")],
     ])
-    await query.message.reply_text("\n".join(lines), parse_mode="HTML", reply_markup=keyboard)
+    await reply_long_text(query.message, lines, parse_mode="HTML", reply_markup=keyboard)
 
 async def cb_closed_period_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Выбор периода для просмотра закрытых (выполненных) задач."""
@@ -2080,7 +2135,7 @@ async def cb_closed_tasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
          InlineKeyboardButton("Месяц",   callback_data="closed_month")],
         [InlineKeyboardButton("◀️ Назад", callback_data="back_main")],
     ])
-    await query.message.reply_text("\n".join(lines), parse_mode="HTML", reply_markup=keyboard)
+    await reply_long_text(query.message, lines, parse_mode="HTML", reply_markup=keyboard)
 
 async def cb_export_dept_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Выбор периода для экспорта в Excel."""
@@ -2189,7 +2244,7 @@ async def cb_dynamics_dept(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         lines.append(f"\n{trend} к прошлой неделе ({'+' if delta>=0 else ''}{delta})")
 
     keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="back_main")]])
-    await query.message.reply_text("\n".join(lines), parse_mode="HTML", reply_markup=keyboard)
+    await reply_long_text(query.message, lines, parse_mode="HTML", reply_markup=keyboard)
 
 # ── NOTIFICATIONS ─────────────────────────────────────────────────────────────
 async def job_request_plans(bot: Bot):
@@ -2255,7 +2310,7 @@ async def job_ping_deadlines(bot: Bot):
         for t in dept_overdue:
             lines.append(f"🔴 {t['assigned_to_name']}: {t['title']} (срок {fmt_dl(t['deadline'])})")
         try:
-            await bot.send_message(int(head["tg_id"]), "\n".join(lines), parse_mode="HTML")
+            await send_long_text(bot, int(head["tg_id"]), lines, parse_mode="HTML")
         except Exception as ex:
             logger.warning(f"overdue notify dept_head {head['tg_id']}: {ex}")
 
@@ -2294,7 +2349,7 @@ async def job_daily_digest(bot: Bot):
             lines.append(f"  🔴 {t['assigned_to_name']}: {t['title']}")
         if len(over) > 3: lines.append(f"  ...и ещё {len(over)-3}")
     try:
-        await bot.send_message(ADMIN_CHAT_ID, "\n".join(lines),
+        await send_long_text(bot, ADMIN_CHAT_ID, lines,
                                parse_mode="HTML", reply_markup=build_admin_keyboard())
     except Exception as ex: logger.warning(f"daily_digest: {ex}")
 
@@ -2348,7 +2403,7 @@ async def job_weekly_audit(bot: Bot):
         lines.append(f"{icon} <b>{e['full_name']}</b> ({get_dept(e['tg_id'])}): "
                      f"отчётов {r_c}, задач ✅{d_c}" + (f" ⚠️{o_c}" if o_c else ""))
     try:
-        await bot.send_message(ADMIN_CHAT_ID, "\n".join(lines), parse_mode="HTML")
+        await send_long_text(bot, ADMIN_CHAT_ID, lines, parse_mode="HTML")
     except Exception as ex: logger.warning(f"weekly_audit: {ex}")
 
 async def job_monthly_audit(bot: Bot):
@@ -2373,7 +2428,7 @@ async def job_monthly_audit(bot: Bot):
         lines.append(f"{icon} <b>{e['full_name']}</b> ({get_dept(e['tg_id'])}): "
                      f"отчётов {r_c}/{wd} ({pct}%), задач ✅{d_c}")
     try:
-        await bot.send_message(ADMIN_CHAT_ID, "\n".join(lines), parse_mode="HTML")
+        await send_long_text(bot, ADMIN_CHAT_ID, lines, parse_mode="HTML")
     except Exception as ex: logger.warning(f"monthly_audit: {ex}")
 
 def _is_this_week(dt_str, iso_week):
