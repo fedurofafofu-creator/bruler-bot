@@ -101,6 +101,7 @@ _gc = None
 _ss = None
 _ws_cache = {}        # name -> Worksheet object, кэшируется навсегда (объект не меняется)
 _data_cache = {}       # name -> (timestamp, rows), короткий TTL чтобы не дёргать API на каждый вызов
+_headers_checked = set()  # name -> уже проверяли заголовок в этом запуске процесса
 DATA_CACHE_TTL = 8     # секунд — этого достаточно чтобы пережить серию из 5-6 команд подряд
 
 def gc():
@@ -141,12 +142,24 @@ def invalidate_cache(name=None):
     else:
         _data_cache.clear()
 
-def ensure_headers(ws, headers):
-    """Гарантирует корректный, не дублирующийся заголовок в первой строке."""
+def ensure_headers(ws, headers, force=False):
+    """
+    Гарантирует корректный, не дублирующийся заголовок в первой строке.
+    Проверяется только один раз за время жизни процесса на каждый лист
+    (через _headers_checked), а не на каждый вызов emp_sheet()/tasks_sheet().
+    Раньше ws.row_values(1) был отдельным API-запросом при КАЖДОМ обращении
+    к листу — при 100+ последовательных вызовах get_dept() в одном цикле это
+    моментально съедало квоту Google Sheets, даже с кэшем данных на месте.
+    force=True используется явно в /fixsheets для принудительной проверки.
+    """
+    cache_key = ws.title
+    if not force and cache_key in _headers_checked:
+        return
     vals = ws.row_values(1)
     if vals != headers:
         # перезаписываем строку заголовка целиком (без сдвига остальных строк)
         ws.update('A1', [headers])
+    _headers_checked.add(cache_key)
 
 def safe_records(ws, headers):
     """
@@ -362,6 +375,220 @@ TH = ["task_id","created_by_id","created_by_name","assigned_to_id",
 
 CHANNEL_LIST = ["Сайт", "Маркетплейсы", "Комиссионеры", "Опт", "Розница", "Bruler Studio", "Не применимо"]
 
+# ── РЕЕСТР КОМАНД ─────────────────────────────────────────────────────────────
+# Единый источник правды для /start, /help и кнопки "Обучение".
+# role: "employee" — видно всем, "dept_head" — видно dept_head и admin,
+# "admin" — видно только admin. Группы задают порядок и заголовки секций.
+COMMAND_REGISTRY = [
+    {
+        "group": "📋 Ежедневная работа",
+        "role": "employee",
+        "items": [
+            ("/plan", "план на день"),
+            ("/mytasks", "мои активные задачи"),
+            ("/changestatus", "сменить статус задачи"),
+            ("/done", "отметить выполненной"),
+            ("/eod", "закрыть день"),
+        ],
+    },
+    {
+        "group": "📌 Управление задачами",
+        "role": "employee",
+        "items": [
+            ("/task", "поставить задачу"),
+            ("/tag", "тег канала для задачи"),
+            ("/edit", "изменить задачу"),
+            ("/status", "карточка задачи по ID"),
+        ],
+    },
+    {
+        "group": "🎛 Панель руководителя",
+        "role": "dept_head",
+        "items": [
+            ("/menu", "все функции отдела/команды кнопками"),
+            ("/team", "кто сдал план сегодня"),
+            ("/tasks_all", "все задачи текстом"),
+            ("/checkstatuses", "запросить статусы прямо сейчас"),
+        ],
+    },
+    {
+        "group": "👑 Администрирование",
+        "role": "admin",
+        "items": [
+            ("/setadmin", "выдать права администратора"),
+            ("/setdepthead", "назначить руководителя отдела"),
+            ("/setdept", "сменить отдел сотрудника"),
+            ("/recovertasks", "восстановить задачи из планов"),
+            ("/fixname", "исправить имя сотрудника"),
+            ("/fixallnames", "нормализовать все имена"),
+            ("/fixsheets", "аварийный ремонт таблиц"),
+        ],
+    },
+]
+
+def commands_for_role(role: str) -> list:
+    """Возвращает список групп команд, видимых для роли employee/dept_head/admin."""
+    visible_roles = {
+        "employee":  {"employee"},
+        "dept_head": {"employee", "dept_head"},
+        "admin":     {"employee", "dept_head", "admin"},
+    }.get(role, {"employee"})
+    return [g for g in COMMAND_REGISTRY if g["role"] in visible_roles]
+
+def format_commands_text(role: str) -> str:
+    """Генерирует текст списка команд для /start — единственный источник правды,
+    устраняет рассинхрон между тем, что написано в приветствии, и тем, что бот
+    реально умеет (было 6 команд в тексте против 19+ зарегистрированных)."""
+    lines = []
+    for group in commands_for_role(role):
+        lines.append(f"\n{group['group']}")
+        for cmd, desc in group["items"]:
+            lines.append(f"{cmd} — {desc}")
+    return "\n".join(lines).strip()
+
+# ── СЦЕНАРИИ ОБУЧЕНИЯ ─────────────────────────────────────────────────────────
+# Короткие карточки "как сделать X", доступные через кнопку 📚 Обучение.
+# Заменяют ручное объяснение новым сотрудникам — обучение через действие,
+# не через текст: каждая карточка кончается кнопкой "Попробовать сейчас".
+LEARN_SCENARIOS = [
+    {
+        "id": "plan", "role": "employee", "label": "📝 Как написать план", "version": 1,
+        "text": (
+            "📝 <b>Как написать план</b>\n\n"
+            "Каждое утро в 11:00 бот сам спросит план.\n"
+            "Просто напиши список дел — каждая строка станет отдельной задачей.\n\n"
+            "Если срок не сегодня — добавь дату в конце строки: [25.06.2026]\n\n"
+            "<i>Пример:</i>\n"
+            "Согласовать смету\n"
+            "Позвонить поставщику [25.06.2026]"
+        ),
+        "try_cmd": "/plan",
+    },
+    {
+        "id": "eod", "role": "employee", "label": "✅ Как закрыть день", "version": 1,
+        "text": (
+            "✅ <b>Как закрыть день</b>\n\n"
+            "В 19:00 бот сам спросит статус по каждой задаче из плана.\n"
+            "Для каждой: выбери статус кнопкой → выбери канал кнопкой → напиши комментарий.\n\n"
+            "Не хочешь ждать до вечера — запусти вручную в любой момент."
+        ),
+        "try_cmd": "/eod",
+    },
+    {
+        "id": "task", "role": "employee", "label": "📌 Как поставить задачу", "version": 1,
+        "text": (
+            "📌 <b>Как поставить задачу</b>\n\n"
+            "Напиши /task → выбери отдел кнопкой → выбери сотрудника кнопкой →\n"
+            "напиши название и срок текстом (например: Сделать макет | 25.06.2026).\n\n"
+            "Исполнитель сразу получит уведомление."
+        ),
+        "try_cmd": "/task",
+    },
+    {
+        "id": "tag", "role": "employee", "label": "🏷 Как тегировать канал", "version": 1,
+        "text": (
+            "🏷 <b>Как тегировать канал</b>\n\n"
+            "Напиши /tag → выбери задачу из списка → выбери канал продаж кнопкой.\n\n"
+            "Каналы: Сайт, Маркетплейсы, Комиссионеры, Опт, Розница, Bruler Studio, Не применимо."
+        ),
+        "try_cmd": "/tag",
+    },
+    {
+        "id": "changestatus", "role": "employee", "label": "🔄 Как сменить статус задачи", "version": 1,
+        "text": (
+            "🔄 <b>Как сменить статус задачи</b>\n\n"
+            "Напиши /changestatus → выбери задачу → выбери новый статус кнопкой.\n\n"
+            "Работает в любой момент дня, не дожидаясь вечернего закрытия дня."
+        ),
+        "try_cmd": "/changestatus",
+    },
+    {
+        "id": "menu", "role": "dept_head", "label": "🎛 Как пользоваться панелью", "version": 1,
+        "text": (
+            "🎛 <b>Как пользоваться панелью /menu</b>\n\n"
+            "Открывает кнопки: задачи отдела, просроченные, отчётность по сотрудникам,\n"
+            "за неделю/месяц. Всё отфильтровано по твоему отделу автоматически."
+        ),
+        "try_cmd": "/menu",
+    },
+    {
+        "id": "remind", "role": "dept_head", "label": "🔔 Как напомнить о задаче", "version": 1,
+        "text": (
+            "🔔 <b>Как напомнить сотруднику о задаче</b>\n\n"
+            "В /menu нажми «🔔 Напомнить о задаче» → выбери задачу из списка отдела.\n\n"
+            "Бот сразу отправит исполнителю напоминание с кнопкой /done."
+        ),
+        "try_cmd": "/menu",
+    },
+    {
+        "id": "export", "role": "admin", "label": "📥 Как выгрузить отчёт", "version": 1,
+        "text": (
+            "📥 <b>Как выгрузить отчёт в Excel</b>\n\n"
+            "В /menu нажми «📥 Экспорт отдела» → выбери период (неделя/месяц).\n\n"
+            "Бот сформирует .xlsx со всеми задачами, статусами и тегами каналов."
+        ),
+        "try_cmd": "/menu",
+    },
+]
+
+def learn_scenarios_for_role(role: str) -> list:
+    """Возвращает сценарии обучения, видимые для роли."""
+    visible_roles = {
+        "employee":  {"employee"},
+        "dept_head": {"employee", "dept_head"},
+        "admin":     {"employee", "dept_head", "admin"},
+    }.get(role, {"employee"})
+    return [s for s in LEARN_SCENARIOS if s["role"] in visible_roles]
+
+# ── ЛИСТ ОБУЧЕНИЯ ─────────────────────────────────────────────────────────────
+# Фиксирует какие сценарии обучения прошёл каждый сотрудник и в какой версии.
+# Когда сценарий обновляется (version растёт после изменения функции бота),
+# старая отметка считается устаревшей — сотруднику нужно пройти его снова.
+LH = ["tg_id", "full_name", "scenario_id", "version", "completed_at"]
+
+def learning_sheet():
+    ws = sheet("learning_progress"); ensure_headers(ws, LH); return ws
+
+def learning_all():
+    return safe_records(learning_sheet(), LH)
+
+def learning_mark_done(tg_id, full_name, scenario_id, version):
+    """Отмечает сценарий пройденным для конкретной версии. Если эта же версия
+    уже отмечена — не дублирует строку."""
+    existing = learning_all()
+    for r in existing:
+        if (str(r["tg_id"]) == str(tg_id) and r["scenario_id"] == scenario_id
+                and str(r["version"]) == str(version)):
+            return  # уже отмечено для этой версии
+    learning_sheet().append_row([
+        tg_id, full_name, scenario_id, version,
+        datetime.now().strftime("%Y-%m-%d %H:%M")
+    ])
+    invalidate_cache("learning_progress")
+
+def learning_completed_versions(tg_id) -> dict:
+    """Возвращает {scenario_id: max_version_completed} для сотрудника."""
+    result = {}
+    for r in learning_all():
+        if str(r["tg_id"]) == str(tg_id):
+            sid = r["scenario_id"]
+            try:
+                v = int(r["version"])
+            except (ValueError, TypeError):
+                continue
+            result[sid] = max(result.get(sid, 0), v)
+    return result
+
+def learning_pending_scenarios(tg_id, role: str) -> list:
+    """
+    Сценарии, которые сотрудник ещё не прошёл в актуальной версии —
+    либо никогда не открывал, либо открывал старую версию до обновления функции.
+    Это и есть механизм 'бот поменялся → направить на ознакомление заново'.
+    """
+    completed = learning_completed_versions(tg_id)
+    available = learn_scenarios_for_role(role)
+    return [s for s in available if completed.get(s["id"], 0) < s["version"]]
+
 def tasks_sheet():
     ws = sheet("tasks"); ensure_headers(ws, TH); return ws
 
@@ -535,6 +762,22 @@ async def cmd_ping(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"({hours}ч {minutes}мин назад)"
     )
 
+async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/help — список команд по роли в любой момент, не только при регистрации.
+    Использует тот же COMMAND_REGISTRY, что /start — единый источник правды."""
+    tg_id = update.effective_user.id
+    if not emp_registered(tg_id):
+        await update.effective_message.reply_text("Сначала /start"); return
+    u = emp_by_id(tg_id)
+    commands_text = format_commands_text(u["role"])
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("📚 Обучение", callback_data="learn_main"),
+    ]])
+    await update.effective_message.reply_text(
+        f"📖 <b>Доступные команды:</b>\n{commands_text}",
+        parse_mode="HTML", reply_markup=keyboard
+    )
+
 # ── /start ────────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     tg_id = update.effective_user.id
@@ -543,11 +786,14 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         role_labels = {"admin": "руководитель", "dept_head": "руководитель отдела", "employee": "сотрудник"}
         role = role_labels.get(u["role"], "сотрудник")
         dept = get_dept(tg_id)
+        commands_text = format_commands_text(u["role"])
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("📚 Обучение", callback_data="learn_main"),
+        ]])
         await update.effective_message.reply_text(
             f"👋 Привет, {u['full_name']}! Ты зарегистрирован как {role} ({dept}).\n\n"
-            "/plan — план на день\n"
-            "/task — поставить задачу\n/mytasks — мои задачи\n"
-            "/done ID — отметить выполненной\n/eod — закрыть день"
+            f"Вот что ты можешь делать:\n{commands_text}",
+            reply_markup=keyboard
         )
         return ConversationHandler.END
     await update.effective_message.reply_text(
@@ -576,11 +822,16 @@ async def cb_reg_dept(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     emp_register(tg_id, username, name, role="employee", department=dept)
 
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("📚 Начать обучение", callback_data="learn_main"),
+    ]])
     await query.edit_message_text(
         f"✅ Готово, {name}! Отдел: <b>{dept}</b>\n\n"
-        "Каждый день в 11:00 — план, в 19:00 — закрытие дня.\n"
-        "/plan — написать план сейчас",
-        parse_mode="HTML"
+        "Каждый день в 11:00 — план, в 19:00 — закрытие дня.\n\n"
+        "Прежде чем начать — пройди короткое обучение, это займёт пару минут "
+        "и покажет, как тут всё работает:",
+        parse_mode="HTML",
+        reply_markup=keyboard
     )
 
     # уведомляем всех руководителей о новом сотруднике
@@ -1190,12 +1441,27 @@ async def cmd_changestatus(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cb_changestatus_task_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Выбрана задача — показываем 4 кнопки статуса (отдельный callback-префикс,
-    не пересекается с EOD-потоком)."""
+    не пересекается с EOD-потоком). Также убираем кнопку выбранной задачи из
+    исходного списка, чтобы она не висела там кликабельной после смены статуса."""
     query = update.callback_query; await query.answer()
     tid = query.data.replace("chstatustask_", "", 1)
     task = task_by_id(tid)
     if not task:
         await query.message.reply_text("Задача не найдена."); return
+
+    # убираем кнопку этой задачи из исходного списка выбора
+    if query.message.reply_markup:
+        new_rows = [
+            row for row in query.message.reply_markup.inline_keyboard
+            if not any(btn.callback_data == query.data for btn in row)
+        ]
+        try:
+            await query.edit_message_reply_markup(
+                reply_markup=InlineKeyboardMarkup(new_rows) if new_rows else None
+            )
+        except Exception:
+            pass  # сообщение могло быть уже изменено параллельно — не критично
+
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("✅ Выполнено",     callback_data=f"chstatus_done_{tid}"),
@@ -1493,6 +1759,9 @@ def build_dept_head_keyboard():
             InlineKeyboardButton("🔔 Напомнить о задаче", callback_data="remind_task_pick"),
             InlineKeyboardButton("📨 Запросить статусы",   callback_data="checkstatuses_now"),
         ],
+        [
+            InlineKeyboardButton("📚 Обучение", callback_data="learn_main"),
+        ],
     ])
 
 def build_admin_keyboard():
@@ -1505,6 +1774,9 @@ def build_admin_keyboard():
         ],
         [
             InlineKeyboardButton("🔧 Восстановить задачи", callback_data="recover_period_pick"),
+        ],
+        [
+            InlineKeyboardButton("📣 Разослать новое обучение", callback_data="notify_learning_pick"),
         ],
     ]
     return InlineKeyboardMarkup(rows)
@@ -1622,14 +1894,16 @@ async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 async def cmd_fixsheets(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Аварийная команда: чинит заголовки во всех листах."""
+    """Аварийная команда: чинит заголовки во всех листах (принудительно, игнорируя кэш проверки)."""
     if not emp_is_admin(update.effective_user.id):
         await update.effective_message.reply_text("⛔ Только для администраторов."); return
     try:
-        ensure_headers(emp_sheet(), EMP_H)
-        ensure_headers(plans_sheet(), PH)
-        ensure_headers(reports_sheet(), RH)
-        ensure_headers(tasks_sheet(), TH)
+        _headers_checked.clear()  # сбрасываем, чтобы ensure_headers реально перепроверил все листы
+        ensure_headers(emp_sheet(), EMP_H, force=True)
+        ensure_headers(plans_sheet(), PH, force=True)
+        ensure_headers(reports_sheet(), RH, force=True)
+        ensure_headers(tasks_sheet(), TH, force=True)
+        invalidate_cache()  # сбрасываем и кэш данных, раз заголовки могли поменяться
         await update.effective_message.reply_text("✅ Заголовки во всех листах исправлены.")
     except Exception as e:
         await update.effective_message.reply_text(f"❌ Ошибка: {e}")
@@ -2018,6 +2292,81 @@ async def cb_checkstatuses_now(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await query.message.reply_text(f"📨 Запрос статусов отправлен {sent} сотрудникам{dept_label}.")
 
 # ── ADMIN CALLBACKS ───────────────────────────────────────────────────────────
+async def cb_learn_main(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Главное меню обучения — список сценариев кнопками, отфильтрован по роли.
+    Каждая кнопка помечена: ✅ пройдено в актуальной версии, 🆕 новое/непройденное."""
+    query = update.callback_query; await query.answer()
+    tg_id = query.from_user.id
+    u = emp_by_id(tg_id)
+    if not u:
+        await query.message.reply_text("Сначала /start"); return
+    scenarios = learn_scenarios_for_role(u["role"])
+    completed = learning_completed_versions(tg_id)
+    buttons = []
+    row = []
+    for s in scenarios:
+        mark = "✅" if completed.get(s["id"], 0) >= s["version"] else "🆕"
+        row.append(InlineKeyboardButton(f"{mark} {s['label']}", callback_data=f"learn_{s['id']}"))
+        if len(row) == 2:
+            buttons.append(row); row = []
+    if row: buttons.append(row)
+    await query.message.reply_text(
+        "📚 Чему хочешь научиться?\n(🆕 — новое или обновлённое, ✅ — уже изучено)",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+async def cb_learn_scenario(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Открывает карточку конкретного сценария с кнопкой 'Попробовать сейчас'.
+    Просмотр карточки фиксируется в листе learning_progress как факт ознакомления."""
+    query = update.callback_query; await query.answer()
+    scenario_id = query.data.replace("learn_", "", 1)
+    scenario = next((s for s in LEARN_SCENARIOS if s["id"] == scenario_id), None)
+    if not scenario:
+        await query.message.reply_text("Сценарий не найден."); return
+
+    tg_id = query.from_user.id
+    u = emp_by_id(tg_id)
+    if u:
+        learning_mark_done(tg_id, u["full_name"], scenario["id"], scenario["version"])
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"▶️ Попробовать {scenario['try_cmd']}", callback_data=f"learntry_{scenario['id']}")],
+        [InlineKeyboardButton("◀️ Назад к обучению", callback_data="learn_main")],
+    ])
+    await query.message.reply_text(scenario["text"], parse_mode="HTML", reply_markup=keyboard)
+
+async def cb_learn_try(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    Кнопка 'Попробовать сейчас'. Команды без ConversationHandler (/eod,
+    /changestatus, /menu, /tag) запускаются прямым вызовом — это безопасно.
+    Команды на ConversationHandler (/plan, /task) НЕЛЬЗЯ запускать так:
+    ConversationHandler отслеживает состояние по тому, что именно ОН обработал
+    update, прямой вызов функции в обход него не регистрирует переход в
+    состояние ожидания текста — следующее сообщение пользователя просто не
+    попадёт в recv_plan/recv_task. Для них показываем точную команду текстом.
+    """
+    query = update.callback_query; await query.answer()
+    scenario_id = query.data.replace("learntry_", "", 1)
+    scenario = next((s for s in LEARN_SCENARIOS if s["id"] == scenario_id), None)
+    if not scenario:
+        return
+    cmd = scenario["try_cmd"].lstrip("/")
+
+    direct_callable = {
+        "eod": cmd_eod, "tag": cmd_tag,
+        "changestatus": cmd_changestatus, "menu": cmd_menu,
+    }
+    if cmd in direct_callable:
+        await direct_callable[cmd](update, ctx)
+        return
+
+    # /plan и /task — через ConversationHandler, нужен реальный текстовый ввод
+    await query.message.reply_text(
+        f"Напиши команду {scenario['try_cmd']} текстом, чтобы начать — "
+        f"кнопка не может запустить её напрямую, ConversationHandler должен "
+        f"увидеть твою команду сам."
+    )
+
 async def cb_back_main(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
     await query.message.reply_text("Выбери действие:", reply_markup=menu_keyboard_for(query.from_user.id))
@@ -2084,6 +2433,69 @@ async def cb_overdue_set_deadline(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         f"📅 Перенесено на {fmt_dl(new_deadline)}:\n{task['title'] if task else tid}",
         parse_mode="HTML"
     )
+
+async def cb_notify_learning_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Admin видит, у каких сценариев есть непройденные версии в команде,
+    и может разослать конкретный сценарий всем сотрудникам сразу."""
+    query = update.callback_query; await query.answer()
+    if not is_strict_admin_check(query): return
+
+    employees = emp_employees()
+    buttons = []
+    for s in LEARN_SCENARIOS:
+        pending_count = 0
+        for e in employees:
+            role = e["role"] if e["role"] in ("employee", "dept_head", "admin") else "employee"
+            if s not in learn_scenarios_for_role(role):
+                continue
+            completed = learning_completed_versions(int(e["tg_id"]))
+            if completed.get(s["id"], 0) < s["version"]:
+                pending_count += 1
+        if pending_count > 0:
+            buttons.append([InlineKeyboardButton(
+                f"{s['label']} — не прошли {pending_count}",
+                callback_data=f"notifylearn_{s['id']}"
+            )])
+
+    if not buttons:
+        await query.message.reply_text("✅ Все сотрудники прошли все актуальные сценарии обучения."); return
+
+    await query.message.reply_text(
+        "📣 Выбери сценарий, чтобы разослать его всем, кто ещё не прошёл:",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+async def cb_notify_learning_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Рассылает карточку сценария всем, у кого она не пройдена в актуальной версии."""
+    query = update.callback_query; await query.answer("Рассылаю...")
+    if not is_strict_admin_check(query): return
+    scenario_id = query.data.replace("notifylearn_", "", 1)
+    scenario = next((s for s in LEARN_SCENARIOS if s["id"] == scenario_id), None)
+    if not scenario:
+        await query.message.reply_text("Сценарий не найден."); return
+
+    employees = emp_employees()
+    sent = 0
+    for e in employees:
+        tg_id = int(e["tg_id"])
+        completed = learning_completed_versions(tg_id)
+        if completed.get(scenario["id"], 0) >= scenario["version"]:
+            continue  # уже прошёл актуальную версию
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"▶️ Попробовать {scenario['try_cmd']}", callback_data=f"learntry_{scenario['id']}")],
+            [InlineKeyboardButton("📚 Всё обучение", callback_data="learn_main")],
+        ])
+        try:
+            await ctx.bot.send_message(
+                tg_id,
+                f"🆕 <b>В боте новая или обновлённая функция!</b>\n\n{scenario['text']}",
+                parse_mode="HTML", reply_markup=keyboard
+            )
+            sent += 1
+        except Exception as ex:
+            logger.warning(f"notify_learning_send {tg_id}: {ex}")
+
+    await query.message.reply_text(f"📣 Разослано {sent} сотрудникам.")
 
 async def cb_remind_task_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Руководитель выбирает задачу своего отдела (или любую, если admin) для напоминания."""
@@ -2813,6 +3225,7 @@ async def post_init(app):
     await app.bot.set_my_commands([
         ("start",     "Регистрация / меню"),
         ("ping",      "Проверка что бот на связи"),
+        ("help",      "Список команд и обучение"),
         ("plan",      "План на день — поддерживает [ДД.ММ.ГГГГ] для другого срока"),
         ("eod",       "Закрыть день — статусы задач"),
         ("task",      "Поставить задачу — выбор отдела и сотрудника кнопками"),
@@ -2890,12 +3303,18 @@ def main():
     app.add_handler(CommandHandler("edit", cmd_edit))
     app.add_handler(CommandHandler("tag", cmd_tag))
     app.add_handler(CommandHandler("ping", cmd_ping))
+    app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("checkstatuses", cmd_checkstatuses))
     app.add_handler(CommandHandler("recovertasks", cmd_recovertasks))
     app.add_handler(CommandHandler("team",      cmd_team))
     app.add_handler(CommandHandler("tasks_all", cmd_tasks_all))
 
     # Callbacks
+    app.add_handler(CallbackQueryHandler(cb_learn_main,          pattern="^learn_main$"))
+    app.add_handler(CallbackQueryHandler(cb_notify_learning_pick, pattern="^notify_learning_pick$"))
+    app.add_handler(CallbackQueryHandler(cb_notify_learning_send, pattern="^notifylearn_"))
+    app.add_handler(CallbackQueryHandler(cb_learn_try,           pattern="^learntry_"))
+    app.add_handler(CallbackQueryHandler(cb_learn_scenario,      pattern="^learn_"))
     app.add_handler(CallbackQueryHandler(cb_confirm_plan,        pattern="^confirm_plan_"))
     app.add_handler(CallbackQueryHandler(cb_tasknew_dept,        pattern="^tasknew_dept_"))
     app.add_handler(CallbackQueryHandler(cb_tasknew_emp,         pattern="^tasknew_emp_"))
