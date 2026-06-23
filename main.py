@@ -409,6 +409,7 @@ COMMAND_REGISTRY = [
             ("/team", "кто сдал план сегодня"),
             ("/tasks_all", "все задачи текстом"),
             ("/checkstatuses", "запросить статусы прямо сейчас"),
+            ("/learningreport", "прогресс обучения команды"),
         ],
     },
     {
@@ -541,42 +542,96 @@ def learn_scenarios_for_role(role: str) -> list:
     return [s for s in LEARN_SCENARIOS if s["role"] in visible_roles]
 
 # ── ЛИСТ ОБУЧЕНИЯ ─────────────────────────────────────────────────────────────
-# Фиксирует какие сценарии обучения прошёл каждый сотрудник и в какой версии.
-# Когда сценарий обновляется (version растёт после изменения функции бота),
-# старая отметка считается устаревшей — сотруднику нужно пройти его снова.
-LH = ["tg_id", "full_name", "scenario_id", "version", "completed_at"]
+# Широкая таблица: одна строка на сотрудника, один столбец на каждый сценарий
+# обучения. Ячейка содержит "✅ vN, ДД.ММ" если пройдено, иначе пусто.
+# Это даёт мгновенно читаемую картину прямо в Google Sheets — открыл таблицу
+# и видно, кто что изучил, без необходимости фильтровать длинный список строк.
+LH_FIXED = ["tg_id", "full_name", "role", "department"]  # фиксированные колонки
+
+def learning_columns() -> list:
+    """Фиксированные колонки + одна колонка на каждый сценарий из LEARN_SCENARIOS,
+    в порядке их определения. Если добавляется новый сценарий — здесь сразу
+    появляется новая колонка при следующем вызове ensure_headers."""
+    return LH_FIXED + [s["id"] for s in LEARN_SCENARIOS]
 
 def learning_sheet():
-    ws = sheet("learning_progress"); ensure_headers(ws, LH); return ws
+    ws = sheet("learning_progress"); ensure_headers(ws, learning_columns()); return ws
 
-def learning_all():
-    return safe_records(learning_sheet(), LH)
+def learning_all() -> list:
+    return safe_records(learning_sheet(), learning_columns())
+
+def learning_format_cell(version: int, completed_at: str) -> str:
+    """Человеко-читаемое содержимое ячейки: статус, версия, дата."""
+    date_part = completed_at.split(" ")[0] if completed_at else ""
+    # переводим YYYY-MM-DD в ДД.ММ для краткости в ячейке
+    if len(date_part) == 10:
+        y, m, d = date_part.split("-")
+        date_part = f"{d}.{m}"
+    return f"✅ v{version}, {date_part}".strip(", ")
+
+def learning_find_or_create_row(tg_id, full_name, role, department) -> int:
+    """Находит строку сотрудника в таблице обучения или создаёт новую.
+    Возвращает 1-indexed номер строки в листе (с учётом заголовка)."""
+    ws = learning_sheet()
+    columns = learning_columns()
+    records = safe_records(ws, columns)
+    for i, r in enumerate(records, start=2):
+        if str(r["tg_id"]) == str(tg_id):
+            return i
+    # не нашли — создаём новую строку с пустыми статусами по всем сценариям
+    blank_row = [tg_id, full_name, role, department] + [""] * len(LEARN_SCENARIOS)
+    ws.append_row(blank_row)
+    invalidate_cache("learning_progress")
+    return len(records) + 2  # +1 за заголовок, +1 за только что добавленную строку
 
 def learning_mark_done(tg_id, full_name, scenario_id, version):
-    """Отмечает сценарий пройденным для конкретной версии. Если эта же версия
-    уже отмечена — не дублирует строку."""
-    existing = learning_all()
-    for r in existing:
-        if (str(r["tg_id"]) == str(tg_id) and r["scenario_id"] == scenario_id
-                and str(r["version"]) == str(version)):
-            return  # уже отмечено для этой версии
-    learning_sheet().append_row([
-        tg_id, full_name, scenario_id, version,
-        datetime.now().strftime("%Y-%m-%d %H:%M")
-    ])
+    """
+    Отмечает сценарий пройденным для сотрудника — записывает читаемый статус
+    прямо в соответствующую колонку. Если в этой колонке уже стоит версия
+    >= текущей — не перезаписывает (избегаем повторной записи той же отметки).
+    """
+    u = emp_by_id(tg_id)
+    role = u["role"] if u else "employee"
+    department = get_dept(tg_id) if u else ""
+
+    columns = learning_columns()
+    if scenario_id not in columns:
+        return  # неизвестный сценарий, не должно происходить
+    col_index = columns.index(scenario_id) + 1  # 1-indexed для gspread
+
+    row = learning_find_or_create_row(tg_id, full_name, role, department)
+    ws = learning_sheet()
+
+    # проверяем текущее значение ячейки, чтобы не перезаписывать более новую версию
+    try:
+        current = ws.cell(row, col_index).value or ""
+    except Exception:
+        current = ""
+    if current:
+        m = re.search(r"v(\d+)", current)
+        if m and int(m.group(1)) >= version:
+            return  # уже отмечена эта версия или новее
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    ws.update_cell(row, col_index, learning_format_cell(version, now))
     invalidate_cache("learning_progress")
 
 def learning_completed_versions(tg_id) -> dict:
-    """Возвращает {scenario_id: max_version_completed} для сотрудника."""
+    """Возвращает {scenario_id: max_version_completed} для сотрудника,
+    разбирая читаемый текст ячеек обратно в числа версий."""
     result = {}
+    columns = learning_columns()
     for r in learning_all():
-        if str(r["tg_id"]) == str(tg_id):
-            sid = r["scenario_id"]
-            try:
-                v = int(r["version"])
-            except (ValueError, TypeError):
+        if str(r["tg_id"]) != str(tg_id):
+            continue
+        for s in LEARN_SCENARIOS:
+            cell_value = r.get(s["id"], "")
+            if not cell_value:
                 continue
-            result[sid] = max(result.get(sid, 0), v)
+            m = re.search(r"v(\d+)", cell_value)
+            if m:
+                result[s["id"]] = int(m.group(1))
+        break
     return result
 
 def learning_pending_scenarios(tg_id, role: str) -> list:
@@ -896,6 +951,8 @@ async def cb_admset_head(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ── /plan ─────────────────────────────────────────────────────────────────────
 async def cmd_plan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.callback_query:
+        await update.callback_query.answer()
     if not emp_registered(update.effective_user.id):
         await update.effective_message.reply_text("Сначала /start")
         return ConversationHandler.END
@@ -950,7 +1007,8 @@ async def recv_plan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML", reply_markup=keyboard
         )
     else:
-        await update.message.reply_text("✅ План записан! Увидимся в 19:00 🌆")
+        learn_kb = pop_learning_continue_keyboard(tg_id)
+        await update.message.reply_text("✅ План записан! Увидимся в 19:00 🌆", reply_markup=learn_kb)
     return ConversationHandler.END
 
 async def cb_confirm_plan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -959,10 +1017,12 @@ async def cb_confirm_plan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_reply_markup(reply_markup=None)
     tg_id = query.data.split("_")[-1]
     tasks = tasks_today_for_user(int(tg_id))
+    learn_kb = pop_learning_continue_keyboard(int(tg_id))
     await query.message.reply_text(
         f"✅ {len(tasks)} задач активны на сегодня.\n"
         f"/mytasks — посмотреть список\n"
-        f"В 19:00 я попрошу статус по каждой."
+        f"В 19:00 я попрошу статус по каждой.",
+        reply_markup=learn_kb
     )
 
 # ── END-OF-DAY FLOW ───────────────────────────────────────────────────────────
@@ -971,6 +1031,30 @@ async def cb_confirm_plan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # и из фоновых заданий APScheduler (доступен только объект Bot, у которого
 # нет bot_data — это атрибут Application, не Bot).
 _eod_state = {}
+
+# Отмечает, что пользователь запустил действие (план/задачу/тег и т.д.) из
+# карточки обучения, через кнопку "Попробовать сейчас". Используется чтобы
+# после завершения действия сразу предложить кнопку "Продолжить обучение",
+# вместо того чтобы человек искал глазами старое сообщение с карточками выше.
+_learning_in_progress = {}  # tg_id -> scenario_id
+
+def mark_learning_action(tg_id, scenario_id):
+    _learning_in_progress[tg_id] = scenario_id
+
+def pop_learning_continue_keyboard(tg_id):
+    """
+    Если действие было запущено из обучения — возвращает клавиатуру с кнопкой
+    'Продолжить обучение' и убирает отметку (одноразовая подсказка на одно
+    завершённое действие). Если действие не из обучения — возвращает None,
+    обычный поток не получает лишних кнопок.
+    """
+    scenario_id = _learning_in_progress.pop(tg_id, None)
+    if not scenario_id:
+        return None
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("📚 Продолжить обучение", callback_data="learn_main"),
+    ]])
+
 
 def status_keyboard(task_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
@@ -995,9 +1079,11 @@ async def start_eod_flow(bot: Bot, tg_id: int):
     tasks = tasks_today_for_user(tg_id)
     if not tasks:
         try:
+            learn_kb = pop_learning_continue_keyboard(tg_id)
             await bot.send_message(tg_id,
                 "🌆 Рабочий день завершается!\n"
-                "Задач на сегодня не было.")
+                "Задач на сегодня не было.",
+                reply_markup=learn_kb)
         except Exception as e:
             logger.warning(f"eod no tasks {tg_id}: {e}")
         return
@@ -1203,9 +1289,11 @@ async def finish_eod(message, ctx, tg_id):
         summary = f"EOD пройден: {done_c}/{total_c} задач выполнено"
         save_report(tg_id, u["full_name"], summary)
 
+    learn_kb = pop_learning_continue_keyboard(tg_id)
     await message.reply_text(
         f"✅ День закрыт! Выполнено {done_c} из {total_c} задач.{streak_line}\n\n"
-        "Хорошего вечера! 🌙"
+        "Хорошего вечера! 🌙",
+        reply_markup=learn_kb
     )
 
 # ── /eod — запуск вручную ────────────────────────────────────────────────────
@@ -1229,10 +1317,12 @@ async def cmd_task(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     Старый текстовый формат @username Название | Дата всё ещё поддерживается
     для тех, кто уже привык.
     """
+    if update.callback_query:
+        await update.callback_query.answer()
     if not emp_registered(update.effective_user.id):
         await update.effective_message.reply_text("Сначала /start")
         return ConversationHandler.END
-    args = " ".join(ctx.args) if ctx.args else ""
+    args = " ".join(ctx.args) if getattr(ctx, "args", None) else ""
     if args and parse_task(args):
         return await do_create_task(update, ctx, parse_task(args))
 
@@ -1321,9 +1411,11 @@ async def recv_tasknew_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML"
         )
     except Exception: pass
+    learn_kb = pop_learning_continue_keyboard(tg_id)
     await update.message.reply_text(
         f"✅ Задача создана!\n<b>{title}</b>\nИсполнитель: {assignee['full_name']}\n"
-        f"Срок: {dl_fmt}\nID: <code>{tid}</code>", parse_mode="HTML"
+        f"Срок: {dl_fmt}\nID: <code>{tid}</code>", parse_mode="HTML",
+        reply_markup=learn_kb
     )
 
 async def recv_task(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1503,6 +1595,9 @@ async def cb_changestatus_apply(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"<b>{task['title']}</b>\nНовый статус: {label}",
         parse_mode="HTML"
     )
+    learn_kb = pop_learning_continue_keyboard(tg_id)
+    if learn_kb:
+        await query.message.reply_text("Продолжим?", reply_markup=learn_kb)
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args:
@@ -1678,6 +1773,9 @@ async def cb_tagchannel_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     task = task_by_id(tid)
     title = task["title"] if task else tid
     await query.edit_message_text(f"✅ Тег «{channel}» проставлен:\n{title}")
+    learn_kb = pop_learning_continue_keyboard(query.from_user.id)
+    if learn_kb:
+        await query.message.reply_text("Продолжим?", reply_markup=learn_kb)
 
 def calc_streak(tg_id: int) -> int:
     """Считает, сколько последних дней подряд у сотрудника ВСЕ задачи плана
@@ -2337,35 +2435,31 @@ async def cb_learn_scenario(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cb_learn_try(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """
-    Кнопка 'Попробовать сейчас'. Команды без ConversationHandler (/eod,
-    /changestatus, /menu, /tag) запускаются прямым вызовом — это безопасно.
-    Команды на ConversationHandler (/plan, /task) НЕЛЬЗЯ запускать так:
-    ConversationHandler отслеживает состояние по тому, что именно ОН обработал
-    update, прямой вызов функции в обход него не регистрирует переход в
-    состояние ожидания текста — следующее сообщение пользователя просто не
-    попадёт в recv_plan/recv_task. Для них показываем точную команду текстом.
+    Кнопка 'Попробовать сейчас' — запускает соответствующую команду напрямую.
+    /plan и /task зарегистрированы в ConversationHandler с дополнительной
+    callback-точкой входа (см. main()), поэтому прямой вызов корректно
+    регистрирует состояние диалога — следующее сообщение пользователя попадёт
+    в recv_plan/recv_task как положено.
     """
-    query = update.callback_query; await query.answer()
-    scenario_id = query.data.replace("learntry_", "", 1)
+    await update.callback_query.answer()  # сразу гасим "загрузку" на кнопке;
+    # повторный answer() внутри cmd_plan/cmd_task безопасен — Telegram просто
+    # проигнорирует второй вызов для того же callback_query.
+
+    scenario_id = update.callback_query.data.replace("learntry_", "", 1)
     scenario = next((s for s in LEARN_SCENARIOS if s["id"] == scenario_id), None)
     if not scenario:
         return
     cmd = scenario["try_cmd"].lstrip("/")
 
-    direct_callable = {
-        "eod": cmd_eod, "tag": cmd_tag,
-        "changestatus": cmd_changestatus, "menu": cmd_menu,
-    }
-    if cmd in direct_callable:
-        await direct_callable[cmd](update, ctx)
-        return
+    mark_learning_action(update.callback_query.from_user.id, scenario_id)
 
-    # /plan и /task — через ConversationHandler, нужен реальный текстовый ввод
-    await query.message.reply_text(
-        f"Напиши команду {scenario['try_cmd']} текстом, чтобы начать — "
-        f"кнопка не может запустить её напрямую, ConversationHandler должен "
-        f"увидеть твою команду сам."
-    )
+    dispatch = {
+        "plan": cmd_plan, "eod": cmd_eod, "task": cmd_task,
+        "tag": cmd_tag, "changestatus": cmd_changestatus, "menu": cmd_menu,
+    }
+    handler = dispatch.get(cmd)
+    if handler:
+        await handler(update, ctx)
 
 async def cb_back_main(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
@@ -2496,6 +2590,38 @@ async def cb_notify_learning_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE
             logger.warning(f"notify_learning_send {tg_id}: {ex}")
 
     await query.message.reply_text(f"📣 Разослано {sent} сотрудникам.")
+
+async def cmd_learningreport(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    Текстовый обзор прогресса обучения по всей команде — кто что прошёл,
+    без необходимости открывать саму Google-таблицу learning_progress.
+    Доступно admin и dept_head (dept_head видит только свой отдел).
+    """
+    tg_id = update.effective_user.id
+    if not emp_has_management_access(tg_id):
+        await update.effective_message.reply_text("⛔ Только для руководителей."); return
+    dept_filter = emp_managed_dept(tg_id)
+
+    employees = emp_employees()
+    if dept_filter:
+        employees = [e for e in employees if get_dept(e["tg_id"]) == dept_filter]
+
+    dept_label = f" — {dept_filter}" if dept_filter else ""
+    lines = [f"📚 <b>Прогресс обучения{dept_label}</b>\n"]
+    for e in employees:
+        role = e["role"] if e["role"] in ("employee", "dept_head", "admin") else "employee"
+        available = learn_scenarios_for_role(role)
+        completed = learning_completed_versions(int(e["tg_id"]))
+        done_count = sum(1 for s in available if completed.get(s["id"], 0) >= s["version"])
+        total = len(available)
+        icon = "✅" if done_count == total else ("🟡" if done_count > 0 else "🔴")
+        pending = [s["label"] for s in available if completed.get(s["id"], 0) < s["version"]]
+        line = f"{icon} <b>{e['full_name']}</b>: {done_count}/{total}"
+        if pending:
+            line += f"\n    не пройдено: {', '.join(pending)}"
+        lines.append(line)
+
+    await reply_long_text(update.effective_message, lines, parse_mode="HTML")
 
 async def cb_remind_task_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Руководитель выбирает задачу своего отдела (или любую, если admin) для напоминания."""
@@ -3239,6 +3365,7 @@ async def post_init(app):
         ("team",      "Сводка команды"),
         ("tasks_all", "Все задачи"),
         ("checkstatuses", "Запросить статусы у команды/отдела прямо сейчас"),
+        ("learningreport", "Прогресс обучения команды"),
         ("recovertasks", "Восстановить пропавшие задачи из планов: /recovertasks [дней]"),
         ("makeadmin", "Стать администратором"),
         ("setdepthead", "Назначить руководителя отдела: /setdepthead @username"),
@@ -3271,12 +3398,18 @@ def main():
         fallbacks=[cancel],
     ))
     app.add_handler(ConversationHandler(
-        entry_points=[CommandHandler("plan", cmd_plan)],
+        entry_points=[
+            CommandHandler("plan", cmd_plan),
+            CallbackQueryHandler(cmd_plan, pattern="^learntry_plan$"),
+        ],
         states={S_PLAN: [MessageHandler(filters.TEXT & ~filters.COMMAND, recv_plan)]},
         fallbacks=[cancel],
     ))
     app.add_handler(ConversationHandler(
-        entry_points=[CommandHandler("task", cmd_task)],
+        entry_points=[
+            CommandHandler("task", cmd_task),
+            CallbackQueryHandler(cmd_task, pattern="^learntry_task$"),
+        ],
         states={S_TASK: [MessageHandler(filters.TEXT & ~filters.COMMAND, recv_task)]},
         fallbacks=[cancel],
     ))
@@ -3304,6 +3437,7 @@ def main():
     app.add_handler(CommandHandler("tag", cmd_tag))
     app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("learningreport", cmd_learningreport))
     app.add_handler(CommandHandler("checkstatuses", cmd_checkstatuses))
     app.add_handler(CommandHandler("recovertasks", cmd_recovertasks))
     app.add_handler(CommandHandler("team",      cmd_team))
