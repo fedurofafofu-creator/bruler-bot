@@ -34,6 +34,7 @@ SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "1LCmoydfS73DKwjQcwMSnpOZxRHiKMAMjO
 ADMIN_CHAT_ID  = int(os.getenv("ADMIN_CHAT_ID", "-5486975908"))
 TZ             = ZoneInfo("Europe/Moscow")
 APZ            = pytz.timezone("Europe/Moscow")
+PROCESS_STARTED_AT = datetime.now(TZ)  # для /ping — видно когда контейнер последний раз перезапускался
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -499,10 +500,8 @@ def parse_plan_items(text: str) -> list:
 S_NAME         = 1
 S_DEPT         = 2    # выбор отдела при регистрации
 S_PLAN         = 10
-S_REPORT       = 11
 S_TASK         = 20
 S_EOD_STATUS   = 30   # выбор статуса задачи конец дня
-S_EOD_COMMENT  = 31   # комментарий + ссылка
 S_EOD_EXTRA    = 32   # были ли другие задачи
 S_EOD_EXTRA_TEXT = 33 # текст других задач
 
@@ -523,9 +522,17 @@ def dept_keyboard(prefix: str, tg_id_for_callback: str = "") -> InlineKeyboardMa
 
 async def cmd_ping(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Мгновенный health-check, без обращения к Google Sheets — проверяет,
-    что бот вообще отвечает, до проверки конкретных функций."""
+    что бот вообще отвечает, до проверки конкретных функций. Показывает время
+    запуска текущего процесса — если оно неожиданно старое, значит Railway
+    не подхватил последний деплой и крутит старый контейнер."""
+    uptime = datetime.now(TZ) - PROCESS_STARTED_AT
+    hours = int(uptime.total_seconds() // 3600)
+    minutes = int((uptime.total_seconds() % 3600) // 60)
     await update.effective_message.reply_text(
-        f"🟢 Бот на связи.\n{datetime.now(TZ).strftime('%d.%m.%Y %H:%M:%S')} МСК"
+        f"🟢 Бот на связи.\n"
+        f"Сейчас: {datetime.now(TZ).strftime('%d.%m.%Y %H:%M:%S')} МСК\n"
+        f"Запущен: {PROCESS_STARTED_AT.strftime('%d.%m.%Y %H:%M:%S')} МСК "
+        f"({hours}ч {minutes}мин назад)"
     )
 
 # ── /start ────────────────────────────────────────────────────────────────────
@@ -538,7 +545,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         dept = get_dept(tg_id)
         await update.effective_message.reply_text(
             f"👋 Привет, {u['full_name']}! Ты зарегистрирован как {role} ({dept}).\n\n"
-            "/plan — план на день\n/report — отчёт\n"
+            "/plan — план на день\n"
             "/task — поставить задачу\n/mytasks — мои задачи\n"
             "/done ID — отметить выполненной\n/eod — закрыть день"
         )
@@ -707,26 +714,13 @@ async def cb_confirm_plan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"В 19:00 я попрошу статус по каждой."
     )
 
-# ── /report ───────────────────────────────────────────────────────────────────
-async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not emp_registered(update.effective_user.id):
-        await update.effective_message.reply_text("Сначала /start")
-        return ConversationHandler.END
-    u = emp_by_id(update.effective_user.id)
-    await update.effective_message.reply_text(
-        f"📊 {u['full_name']}, напиши итоговый отчёт за день:\n"
-        "Что сделано, что переносится, что заблокировано."
-    )
-    return S_REPORT
-
-async def recv_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    tg_id = update.effective_user.id
-    u = emp_by_id(tg_id)
-    save_report(tg_id, u["full_name"], update.message.text.strip())
-    await update.message.reply_text("✅ Отчёт записан! Хорошего вечера 🌙")
-    return ConversationHandler.END
-
 # ── END-OF-DAY FLOW ───────────────────────────────────────────────────────────
+# Состояние активных EOD-сессий по tg_id. Module-level, а не ctx.bot_data,
+# потому что start_eod_flow вызывается и из обработчиков (ctx доступен),
+# и из фоновых заданий APScheduler (доступен только объект Bot, у которого
+# нет bot_data — это атрибут Application, не Bot).
+_eod_state = {}
+
 def status_keyboard(task_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
@@ -740,20 +734,24 @@ def status_keyboard(task_id: str) -> InlineKeyboardMarkup:
     ])
 
 async def start_eod_flow(bot: Bot, tg_id: int):
-    """Запускает опрос статусов задач для сотрудника."""
+    """
+    Запускает опрос статусов задач для сотрудника.
+    Важно: эта функция вызывается и из обработчиков команд (где доступен ctx.bot_data),
+    и из фоновых заданий APScheduler (где доступен только сам bot, без ctx).
+    Поэтому состояние EOD-сессии хранится в module-level _eod_state, а не в
+    ctx.bot_data/bot.bot_data — это единое хранилище, видимое из обоих мест.
+    """
     tasks = tasks_today_for_user(tg_id)
     if not tasks:
         try:
             await bot.send_message(tg_id,
                 "🌆 Рабочий день завершается!\n"
-                "Задач на сегодня не было. Напиши отчёт: /report")
+                "Задач на сегодня не было.")
         except Exception as e:
             logger.warning(f"eod no tasks {tg_id}: {e}")
         return
 
-    if "eod" not in bot.bot_data:
-        bot.bot_data["eod"] = {}
-    bot.bot_data["eod"][tg_id] = {
+    _eod_state[tg_id] = {
         "tasks": tasks,
         "current_idx": 0,
         "results": []
@@ -773,7 +771,7 @@ async def start_eod_flow(bot: Bot, tg_id: int):
         logger.warning(f"eod start {tg_id}: {e}")
 
 async def cb_eod_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Callback: сотрудник выбрал статус задачи."""
+    """Callback: сотрудник выбрал статус задачи → сразу предлагаем выбрать канал."""
     query = update.callback_query
     await query.answer()
     tg_id = query.from_user.id
@@ -786,7 +784,7 @@ async def cb_eod_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     task_update_status(task_id, status)
 
-    eod = ctx.bot_data.get("eod", {}).get(tg_id)
+    eod = _eod_state.get(tg_id)
     if not eod:
         await query.edit_message_reply_markup(reply_markup=None)
         return
@@ -806,7 +804,36 @@ async def cb_eod_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML"
     )
 
-    # Запрашиваем комментарий
+    # Сразу предлагаем выбрать канал продаж — без отдельного текстового комментария
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(ch, callback_data=f"eodchannel_{task_id}_{ch}") for ch in CHANNEL_LIST[i:i+2]]
+        for i in range(0, len(CHANNEL_LIST), 2)
+    ])
+    await query.message.reply_text(
+        f"🏷 К какому каналу относится задача:\n<b>{eod['tasks'][eod['current_idx']]['title']}</b>",
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+
+async def cb_eod_channel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Канал выбран кнопкой — сохраняем тег и запрашиваем обязательный комментарий."""
+    query = update.callback_query
+    await query.answer("✅ Записано")
+    tg_id = query.from_user.id
+
+    rest = query.data.replace("eodchannel_", "", 1)
+    task_id, channel = rest.split("_", 1)
+    task_update_channel(task_id, channel)
+
+    await query.edit_message_text(
+        query.message.text + f"\n\n<b>Канал: {channel}</b>",
+        parse_mode="HTML"
+    )
+
+    eod = _eod_state.get(tg_id)
+    if not eod:
+        return
+
     ctx.bot_data.setdefault("eod_pending_comment", {})[tg_id] = task_id
     await query.message.reply_text(
         f"💬 Обязательный комментарий по задаче:\n<b>{eod['tasks'][eod['current_idx']]['title']}</b>\n\n"
@@ -817,7 +844,7 @@ async def cb_eod_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 async def recv_eod_comment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Получаем комментарий к задаче EOD."""
+    """Получаем обязательный комментарий к задаче — последний шаг перед следующей задачей."""
     tg_id = update.effective_user.id
     pending = ctx.bot_data.get("eod_pending_comment", {})
     task_id = pending.get(tg_id)
@@ -835,7 +862,7 @@ async def recv_eod_comment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     task_update_comment(task_id, comment, link)
     del pending[tg_id]
 
-    eod = ctx.bot_data.get("eod", {}).get(tg_id)
+    eod = _eod_state.get(tg_id)
     if not eod:
         return
 
@@ -852,15 +879,15 @@ async def recv_eod_comment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
     else:
         # все задачи обработаны
-        await ask_extra_tasks(update, ctx, tg_id)
+        await ask_extra_tasks(update.message, ctx, tg_id)
 
-async def ask_extra_tasks(update, ctx, tg_id):
+async def ask_extra_tasks(message, ctx, tg_id):
     """Спрашиваем были ли другие задачи."""
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ Да, были", callback_data="eod_extra_yes"),
         InlineKeyboardButton("❌ Нет", callback_data="eod_extra_no"),
     ]])
-    await update.message.reply_text(
+    await message.reply_text(
         "🎉 Все задачи из плана отмечены!\n\n"
         "Были ли сегодня <b>другие задачи</b>, не из плана?",
         parse_mode="HTML",
@@ -899,14 +926,15 @@ async def recv_eod_extra(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         tid = task_create(tg_id, u["full_name"], tg_id, u["full_name"],
                           item, item_deadline, source="extra")
         task_update_status(tid, "done")
-        task_update_comment(tid, "Выполнено вне плана")
 
     await update.message.reply_text(f"✅ Добавлено ещё {len(items)} выполненных задач.")
     await finish_eod(update.message, ctx, tg_id)
 
 async def finish_eod(message, ctx, tg_id):
-    """Завершаем EOD — просим написать отчёт."""
-    eod = ctx.bot_data.get("eod", {}).pop(tg_id, {})
+    """Завершаем EOD. Автоматически сохраняем сводку как 'отчёт' — это даёт
+    руководителям статистику 'кто закрыл день' без отдельного текстового
+    отчёта от сотрудника, который мы убрали по их запросу."""
+    eod = _eod_state.pop(tg_id, {})
     results = eod.get("results", [])
     done_c = sum(1 for r in results if r["status"] == "done")
     total_c = len(results)
@@ -919,9 +947,13 @@ async def finish_eod(message, ctx, tg_id):
         elif streak == 1:
             streak_line = "\n🌱 Отличное начало серии — продолжай завтра!"
 
+    u = emp_by_id(tg_id)
+    if u and not has_report_today(tg_id):
+        summary = f"EOD пройден: {done_c}/{total_c} задач выполнено"
+        save_report(tg_id, u["full_name"], summary)
+
     await message.reply_text(
         f"✅ День закрыт! Выполнено {done_c} из {total_c} задач.{streak_line}\n\n"
-        "Теперь напиши итоговый отчёт за день — /report\n"
         "Хорошего вечера! 🌙"
     )
 
@@ -1081,21 +1113,41 @@ async def do_create_task(update, ctx, parsed):
 
 # ── /done /status /mytasks ────────────────────────────────────────────────────
 async def cmd_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    /done — диалоговый выбор: своя активная задача кнопками, отмечается выполненной сразу.
+    /done ID [комментарий] — старый текстовый вариант для тех, кто уже привык.
+    """
     if not ctx.args:
-        await update.effective_message.reply_text("Укажи ID: /done ABCD1234"); return
+        tg_id = update.effective_user.id
+        my_tasks = tasks_for_user(tg_id)
+        if not my_tasks:
+            await update.effective_message.reply_text("У тебя нет активных задач."); return
+        buttons = []
+        for t in my_tasks[:30]:
+            label = t["title"][:40] + ("…" if len(t["title"]) > 40 else "")
+            buttons.append([InlineKeyboardButton(f"✅ {label}", callback_data=f"donetask_{t['task_id']}")])
+        await update.effective_message.reply_text(
+            "Какую задачу отметить выполненной?",
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return
+
     tid = ctx.args[0].upper()
     comment = " ".join(ctx.args[1:])
+    await _mark_task_done(update.effective_message, ctx.bot, update.effective_user.id, tid, comment)
+
+async def _mark_task_done(message, bot, tg_id, tid, comment=""):
+    """Общая логика отметки задачи выполненной — используется и текстовой командой, и кнопкой."""
     task = task_by_id(tid)
     if not task:
-        await update.effective_message.reply_text(f"❌ Задача {tid} не найдена."); return
-    tg_id = update.effective_user.id
+        await message.reply_text(f"❌ Задача {tid} не найдена."); return
     if str(task["assigned_to_id"]) != str(tg_id) and not emp_is_admin(tg_id):
-        await update.effective_message.reply_text("❌ Это не твоя задача."); return
+        await message.reply_text("❌ Это не твоя задача."); return
     task_update_status(tid, "done")
     if comment:
         task_update_comment(tid, comment)
     try:
-        await ctx.bot.send_message(
+        await bot.send_message(
             int(task["created_by_id"]),
             f"✅ Задача выполнена!\n<b>{task['title']}</b>\n"
             f"Выполнил: {task['assigned_to_name']}\nID: <code>{tid}</code>"
@@ -1103,9 +1155,16 @@ async def cmd_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML"
         )
     except Exception: pass
-    await update.effective_message.reply_text(
+    await message.reply_text(
         f"✅ Задача <code>{tid}</code> выполнена!", parse_mode="HTML"
     )
+
+async def cb_donetask_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Кнопка из /done — отмечаем выбранную задачу выполненной."""
+    query = update.callback_query; await query.answer("✅ Отмечено!")
+    tid = query.data.replace("donetask_", "", 1)
+    await query.edit_message_reply_markup(reply_markup=None)
+    await _mark_task_done(query.message, ctx.bot, query.from_user.id, tid)
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args:
@@ -1129,46 +1188,98 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """
+    /edit — диалоговый выбор: своя задача кнопками → поле (название/срок) кнопками → текст значения.
     /edit ID title Новое название
     /edit ID deadline ДД.ММ.ГГГГ
     Изменить может постановщик, исполнитель или администратор.
     """
-    if len(ctx.args) < 3:
-        await update.effective_message.reply_text(
-            "Формат:\n"
-            "<code>/edit ID title Новое название</code>\n"
-            "<code>/edit ID deadline ДД.ММ.ГГГГ</code>",
-            parse_mode="HTML"
-        )
+    tg_id = update.effective_user.id
+    if len(ctx.args) >= 3:
+        tid = ctx.args[0].upper()
+        field = ctx.args[1].lower()
+        value = " ".join(ctx.args[2:])
+        await _apply_edit(update.effective_message, tg_id, tid, field, value)
         return
-    tid = ctx.args[0].upper()
-    field = ctx.args[1].lower()
-    value = " ".join(ctx.args[2:])
 
+    # диалоговый режим — задачи, которые можно редактировать: свои + те, что сам поставил
+    my_tasks = tasks_for_user(tg_id)
+    all_t = tasks_all()
+    created_by_me = [t for t in all_t if str(t["created_by_id"]) == str(tg_id)
+                     and t["status"] != "done" and t["task_id"] not in {x["task_id"] for x in my_tasks}]
+    editable = my_tasks + created_by_me
+    if not editable:
+        await update.effective_message.reply_text("Нет задач, доступных для редактирования."); return
+
+    buttons = []
+    for t in editable[:30]:
+        label = t["title"][:35] + ("…" if len(t["title"]) > 35 else "")
+        buttons.append([InlineKeyboardButton(label, callback_data=f"edittask_{t['task_id']}")])
+    await update.effective_message.reply_text(
+        "Какую задачу изменить?",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+async def cb_edittask_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Выбрана задача — показываем выбор поля: название или срок."""
+    query = update.callback_query; await query.answer()
+    tid = query.data.replace("edittask_", "", 1)
     task = task_by_id(tid)
     if not task:
-        await update.effective_message.reply_text(f"❌ Задача {tid} не найдена."); return
+        await query.message.reply_text("Задача не найдена."); return
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✏️ Название", callback_data=f"editfield_title_{tid}"),
+         InlineKeyboardButton("📅 Срок", callback_data=f"editfield_deadline_{tid}")],
+    ])
+    await query.message.reply_text(
+        f"Что изменить в задаче:\n<b>{task['title']}</b>",
+        parse_mode="HTML", reply_markup=keyboard
+    )
 
+async def cb_editfield_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Выбрано поле — просим новое значение текстом."""
+    query = update.callback_query; await query.answer()
+    rest = query.data.replace("editfield_", "", 1)
+    field, tid = rest.split("_", 1)
+    tg_id = query.from_user.id
+    ctx.bot_data.setdefault("edit_pending", {})[tg_id] = (tid, field)
+    hint = "Напиши новое название:" if field == "title" else "Напиши новый срок в формате ДД.ММ.ГГГГ:"
+    await query.message.reply_text(hint)
+
+async def recv_edit_value(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Получаем новое значение поля после выбора кнопками."""
     tg_id = update.effective_user.id
+    pending = ctx.bot_data.get("edit_pending", {})
+    if tg_id not in pending:
+        return
+    tid, field = pending.pop(tg_id)
+    value = update.message.text.strip()
+    await _apply_edit(update.message, tg_id, tid, field, value)
+
+async def _apply_edit(message, tg_id, tid, field, value):
+    """Общая логика применения правки — используется текстовой командой и кнопочным флоу."""
+    task = task_by_id(tid)
+    if not task:
+        await message.reply_text(f"❌ Задача {tid} не найдена."); return
+
     allowed = (str(task["assigned_to_id"]) == str(tg_id)
                or str(task["created_by_id"]) == str(tg_id)
                or emp_is_admin(tg_id))
     if not allowed:
-        await update.effective_message.reply_text("❌ Можно редактировать только свои задачи."); return
+        await message.reply_text("❌ Можно редактировать только свои задачи."); return
 
     if field == "title":
         task_update_title(tid, value)
-        await update.effective_message.reply_text(f"✅ Название обновлено:\n<b>{value}</b>", parse_mode="HTML")
+        await message.reply_text(f"✅ Название обновлено:\n<b>{value}</b>", parse_mode="HTML")
     elif field == "deadline":
         m = re.match(r"^(\d{2})\.(\d{2})\.(\d{4})$", value.strip())
         if not m:
-            await update.effective_message.reply_text("❌ Формат даты: ДД.ММ.ГГГГ"); return
+            await message.reply_text("❌ Формат даты: ДД.ММ.ГГГГ"); return
         d, mo, y = m.groups()
         new_deadline = f"{y}-{mo}-{d}"
         task_update_deadline(tid, new_deadline)
-        await update.effective_message.reply_text(f"✅ Срок обновлён: {value}")
+        await message.reply_text(f"✅ Срок обновлён: {value}")
     else:
-        await update.effective_message.reply_text("Поле должно быть title или deadline.")
+        await message.reply_text("Поле должно быть title или deadline.")
 
 async def cmd_tag(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """
@@ -1282,17 +1393,23 @@ async def cmd_mytasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await reply_long_text(update.effective_message, lines, parse_mode="HTML")
 
 # ── ADMIN KEYBOARD ────────────────────────────────────────────────────────────
-def build_admin_keyboard():
+def build_dept_head_keyboard():
+    """
+    Базовая панель для dept_head и admin: задачи отдела/команды, статусы,
+    отчётность по своей зоне видимости. Без чисто административных функций
+    (восстановление задач, экспорт, динамика) — это отдельная клавиатура admin.
+    """
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("📋 Задачи сегодня",   callback_data="tasks_today"),
             InlineKeyboardButton("📋 Все активные",     callback_data="show_all_tasks"),
         ],
         [
+            InlineKeyboardButton("⚠️ Просроченные",     callback_data="overdue_pick"),
             InlineKeyboardButton("✅ Закрытые задачи",  callback_data="closed_period_pick"),
-            InlineKeyboardButton("📊 По отделам",       callback_data="summary_depts"),
         ],
         [
+            InlineKeyboardButton("📊 По отделам",       callback_data="summary_depts"),
             InlineKeyboardButton("👤 По сотруднику",    callback_data="summary_person_list"),
         ],
         [
@@ -1300,14 +1417,29 @@ def build_admin_keyboard():
             InlineKeyboardButton("📅 За месяц",         callback_data="period_month"),
         ],
         [
-            InlineKeyboardButton("📥 Экспорт отдела",   callback_data="export_dept_pick"),
-            InlineKeyboardButton("📈 Динамика",         callback_data="dynamics_dept"),
-        ],
-        [
-            InlineKeyboardButton("🔧 Восстановить задачи", callback_data="recover_period_pick"),
+            InlineKeyboardButton("🔔 Напомнить о задаче", callback_data="remind_task_pick"),
             InlineKeyboardButton("📨 Запросить статусы",   callback_data="checkstatuses_now"),
         ],
     ])
+
+def build_admin_keyboard():
+    """Полная панель для admin: всё из dept_head + чисто административные функции."""
+    rows = build_dept_head_keyboard().inline_keyboard
+    rows = list(rows) + [
+        [
+            InlineKeyboardButton("📥 Экспорт отдела",      callback_data="export_dept_pick"),
+            InlineKeyboardButton("📈 Динамика",            callback_data="dynamics_dept"),
+        ],
+        [
+            InlineKeyboardButton("🔧 Восстановить задачи", callback_data="recover_period_pick"),
+        ],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+def menu_keyboard_for(tg_id: int):
+    """Возвращает правильную клавиатуру по роли: dept_head видит базовую,
+    admin видит полную с административным блоком."""
+    return build_admin_keyboard() if emp_is_admin(tg_id) else build_dept_head_keyboard()
 
 def fmt_dl(deadline: str) -> str:
     if not deadline: return "—"
@@ -1364,7 +1496,14 @@ async def send_long_text(bot, chat_id, lines: list, parse_mode="HTML", reply_mar
         )
 
 def is_admin_check(query) -> bool:
+    """Допускает dept_head и admin — для общих функций панели руководителя."""
     return emp_has_management_access(query.from_user.id)
+
+def is_strict_admin_check(query) -> bool:
+    """Только admin — для чисто административных функций (экспорт, динамика,
+    восстановление задач), которых dept_head не должен видеть вообще, даже
+    если узнает callback_data каким-то иным путём."""
+    return emp_is_admin(query.from_user.id)
 
 def dept_filter_for(query) -> str:
     """Пустая строка для admin (видит всё), иначе название отдела."""
@@ -1401,12 +1540,12 @@ async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = (
         f"🎛 <b>Панель управления{dept_label} — {today}</b>\n\n"
         f"📋 Планов: {len(my_plan_ids)}/{len(employees)}\n"
-        f"📝 Отчётов: {len(my_report_ids)}/{len(employees)}\n"
+        f"📝 День закрыт (EOD): {len(my_report_ids)}/{len(employees)}\n"
         f"✅ Задач активных: {len(open_t)}\n"
         + (f"⚠️ Просроченных: {len(over)}\n" if over else "")
     )
     await update.effective_message.reply_text(
-        text, parse_mode="HTML", reply_markup=build_admin_keyboard()
+        text, parse_mode="HTML", reply_markup=menu_keyboard_for(tg_id)
     )
 
 async def cmd_fixsheets(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1528,20 +1667,54 @@ async def cb_sethead_emp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception: pass
 
 async def cmd_setdept(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """/setdept @username — открыть кнопки выбора отдела для сотрудника."""
+    """
+    /setdept — диалоговый выбор: сотрудник из списка → новый отдел, кнопками.
+    /setdept @username — старый текстовый вариант для тех, кто уже привык.
+    """
     if not emp_is_admin(update.effective_user.id):
         await update.effective_message.reply_text("⛔ Только для администраторов."); return
-    if not ctx.args:
-        await update.effective_message.reply_text("Укажи: /setdept @username"); return
-    username = ctx.args[0].lstrip("@")
-    for e in emp_all():
-        if e["username"].lstrip("@").lower() == username.lower():
-            await update.effective_message.reply_text(
-                f"Выбери отдел для {e['full_name']}:",
-                reply_markup=dept_keyboard("admset_dept_", str(e["tg_id"]))
-            )
-            return
-    await update.effective_message.reply_text(f"❌ @{username} не найден.")
+
+    if ctx.args:
+        username = ctx.args[0].lstrip("@")
+        for e in emp_all():
+            if e["username"].lstrip("@").lower() == username.lower():
+                await update.effective_message.reply_text(
+                    f"Выбери отдел для {e['full_name']}:",
+                    reply_markup=dept_keyboard("admset_dept_", str(e["tg_id"]))
+                )
+                return
+        await update.effective_message.reply_text(f"❌ @{username} не найден.")
+        return
+
+    # диалоговый режим — список всех сотрудников по именам
+    emps = emp_employees()
+    if not emps:
+        await update.effective_message.reply_text("Нет зарегистрированных сотрудников."); return
+    buttons = []
+    row = []
+    for e in emps:
+        row.append(InlineKeyboardButton(e["full_name"], callback_data=f"setdeptemp_{e['tg_id']}"))
+        if len(row) == 2:
+            buttons.append(row); row = []
+    if row: buttons.append(row)
+    await update.effective_message.reply_text(
+        "Кому сменить отдел? Выбери сотрудника:",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+async def cb_setdeptemp_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Выбран сотрудник — показываем кнопки отделов."""
+    query = update.callback_query; await query.answer()
+    if not emp_is_admin(query.from_user.id):
+        await query.answer("⛔ Только для администраторов.", show_alert=True); return
+    target_tg_id = query.data.replace("setdeptemp_", "", 1)
+    emp = emp_by_id(int(target_tg_id))
+    if not emp:
+        await query.message.reply_text("Сотрудник не найден."); return
+    await query.message.reply_text(
+        f"Выбери отдел для {emp['full_name']}:",
+        reply_markup=dept_keyboard("admset_dept_", target_tg_id)
+    )
 
 async def cmd_fixname(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/fixname @username Имя Фамилия — вручную исправить порядок имени/фамилии."""
@@ -1592,7 +1765,7 @@ async def cmd_team(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         tid = str(e["tg_id"])
         lines.append(
             f"{'✅' if tid in report_ids else '❌'} <b>{e['full_name']}</b>  "
-            f"план {'✅' if tid in plan_ids else '❌'}  отчёт {'✅' if tid in report_ids else '—'}"
+            f"план {'✅' if tid in plan_ids else '❌'}  EOD {'✅' if tid in report_ids else '—'}"
         )
     await reply_long_text(update.effective_message, lines, parse_mode="HTML")
 
@@ -1695,10 +1868,11 @@ def recover_tasks_from_plans(date_from: str, date_to: str, dept_filter: str = ""
     return recovered, by_person, sorted(affected_dates)
 
 async def cmd_recovertasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """/recovertasks [N] — восстановить задачи из планов за последние N дней (по умолчанию 7)."""
+    """/recovertasks [N] — восстановить задачи из планов за последние N дней (по умолчанию 7).
+    Только для admin — dept_head не должен иметь доступа к этой функции."""
     tg_id = update.effective_user.id
-    if not emp_has_management_access(tg_id):
-        await update.effective_message.reply_text("⛔ Только для руководителей."); return
+    if not emp_is_admin(tg_id):
+        await update.effective_message.reply_text("⛔ Только для администраторов."); return
     dept_filter = emp_managed_dept(tg_id)
 
     days_back = 7
@@ -1773,12 +1947,119 @@ async def cb_checkstatuses_now(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── ADMIN CALLBACKS ───────────────────────────────────────────────────────────
 async def cb_back_main(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
-    await query.message.reply_text("Выбери действие:", reply_markup=build_admin_keyboard())
+    await query.message.reply_text("Выбери действие:", reply_markup=menu_keyboard_for(query.from_user.id))
+
+async def cb_overdue_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Список просроченных задач — каждая с кнопкой выбора действия."""
+    query = update.callback_query; await query.answer()
+    if not is_admin_check(query): return
+    dept_filter = dept_filter_for(query)
+    over = tasks_overdue()
+    if dept_filter:
+        over = [t for t in over if get_dept(t["assigned_to_id"]) == dept_filter]
+    if not over:
+        await query.message.reply_text("✅ Нет просроченных задач!"); return
+
+    dept_label = f" — {dept_filter}" if dept_filter else ""
+    await query.message.reply_text(f"⚠️ <b>Просроченные задачи{dept_label} ({len(over)}):</b>", parse_mode="HTML")
+    for t in over[:20]:
+        text = (f"🔴 <b>{t['title']}</b>\n"
+                f"Исполнитель: {t['assigned_to_name']}\n"
+                f"Срок был: {fmt_dl(t['deadline'])}")
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Закрыть", callback_data=f"overduedone_{t['task_id']}"),
+            InlineKeyboardButton("📅 Перенести", callback_data=f"overduemove_{t['task_id']}"),
+        ]])
+        await query.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
+    if len(over) > 20:
+        await query.message.reply_text(f"… и ещё {len(over)-20}. Используй 📥 Экспорт отдела для полного списка.")
+
+async def cb_overdue_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Закрыть просроченную задачу прямо из списка."""
+    query = update.callback_query; await query.answer("✅ Закрыто")
+    if not is_admin_check(query): return
+    tid = query.data.replace("overduedone_", "", 1)
+    task_update_status(tid, "done")
+    task = task_by_id(tid)
+    await query.edit_message_text(f"✅ Закрыто:\n{task['title'] if task else tid}", parse_mode="HTML")
+
+async def cb_overdue_move_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Выбор нового срока для просроченной задачи."""
+    query = update.callback_query; await query.answer()
+    if not is_admin_check(query): return
+    tid = query.data.replace("overduemove_", "", 1)
+    today = date.today()
+    options = [
+        ("Сегодня", today),
+        ("Завтра", today + timedelta(days=1)),
+        ("+3 дня", today + timedelta(days=3)),
+        ("+неделя", today + timedelta(days=7)),
+    ]
+    buttons = [[InlineKeyboardButton(label, callback_data=f"overduesetdl_{tid}_{d.strftime('%Y-%m-%d')}")]
+               for label, d in options]
+    await query.message.reply_text("На какой срок перенести?", reply_markup=InlineKeyboardMarkup(buttons))
+
+async def cb_overdue_set_deadline(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Применяет новый срок к просроченной задаче."""
+    query = update.callback_query; await query.answer("📅 Перенесено")
+    if not is_admin_check(query): return
+    rest = query.data.replace("overduesetdl_", "", 1)
+    tid, new_deadline = rest.rsplit("_", 1)
+    task_update_deadline(tid, new_deadline)
+    task = task_by_id(tid)
+    await query.edit_message_text(
+        f"📅 Перенесено на {fmt_dl(new_deadline)}:\n{task['title'] if task else tid}",
+        parse_mode="HTML"
+    )
+
+async def cb_remind_task_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Руководитель выбирает задачу своего отдела (или любую, если admin) для напоминания."""
+    query = update.callback_query; await query.answer()
+    if not is_admin_check(query): return
+    dept_filter = dept_filter_for(query)
+    open_t = tasks_open()
+    if dept_filter:
+        open_t = [t for t in open_t if get_dept(t["assigned_to_id"]) == dept_filter]
+    if not open_t:
+        await query.message.reply_text("Нет активных задач для напоминания."); return
+    buttons = []
+    for t in open_t[:30]:
+        label = f"{t['assigned_to_name'].split()[0]}: {t['title'][:30]}" + ("…" if len(t['title']) > 30 else "")
+        buttons.append([InlineKeyboardButton(label, callback_data=f"remindtask_{t['task_id']}")])
+    await query.message.reply_text(
+        "О какой задаче напомнить?",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+async def cb_remind_task_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Отправляет напоминание исполнителю выбранной задачи."""
+    query = update.callback_query; await query.answer("📨 Напоминание отправлено")
+    if not is_admin_check(query): return
+    tid = query.data.replace("remindtask_", "", 1)
+    task = task_by_id(tid)
+    if not task:
+        await query.message.reply_text("Задача не найдена."); return
+
+    sender = emp_by_id(query.from_user.id)
+    try:
+        await ctx.bot.send_message(
+            int(task["assigned_to_id"]),
+            f"🔔 Напоминание от {sender['full_name']}!\n\n"
+            f"<b>{task['title']}</b>\n"
+            f"Срок: {fmt_dl(task['deadline'])}\n"
+            f"ID: <code>{tid}</code>\n\n"
+            f"/done {tid} — отметить выполненной",
+            parse_mode="HTML"
+        )
+        await query.message.reply_text(f"✅ Напомнила {task['assigned_to_name']} о задаче «{task['title']}».")
+    except Exception as ex:
+        logger.warning(f"remind_task_send: {ex}")
+        await query.message.reply_text("❌ Не удалось отправить напоминание.")
 
 async def cb_recover_period_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Выбор периода для восстановления задач из планов."""
     query = update.callback_query; await query.answer()
-    if not is_admin_check(query): return
+    if not is_strict_admin_check(query): return
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("Сегодня",      callback_data="recover_run_1")],
         [InlineKeyboardButton("3 дня",        callback_data="recover_run_3")],
@@ -1794,7 +2075,7 @@ async def cb_recover_period_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
 async def cb_recover_run(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Запускает восстановление задач за выбранный период."""
     query = update.callback_query; await query.answer("Сканирую планы...")
-    if not is_admin_check(query): return
+    if not is_strict_admin_check(query): return
     tg_id = query.from_user.id
     dept_filter = dept_filter_for(query)
 
@@ -1925,7 +2206,7 @@ async def cb_summary_depts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         and t["status"] != "done" and t.get("deadline","") < today)
         icon = "✅" if submitted == len(emps) else ("🟡" if submitted > 0 else "🔴")
         lines.append(f"{icon} <b>{dept}</b> ({len(emps)} чел.)")
-        lines.append(f"  планов {planned}/{len(emps)}  отчётов {submitted}/{len(emps)}"
+        lines.append(f"  планов {planned}/{len(emps)}  EOD закрыт {submitted}/{len(emps)}"
                      + (f"  ⚠️{overdue_c}" if overdue_c else ""))
         for e in emps:
             tid = str(e["tg_id"])
@@ -1975,7 +2256,7 @@ async def cb_summary_person(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     sl = {"open":"⬜","in_progress":"🔄","paused":"⏸","done":"✅"}
     lines = [
         f"👤 <b>{emp['full_name']}</b>  ({get_dept(tg_id)})",
-        f"Сегодня {today_fmt}:  план {'✅' if tg_id in plan_ids else '❌'}  отчёт {'✅' if tg_id in report_ids else '❌'}\n",
+        f"Сегодня {today_fmt}:  план {'✅' if tg_id in plan_ids else '❌'}  EOD {'✅' if tg_id in report_ids else '❌'}\n",
     ]
     if emp_tasks:
         lines.append(f"<b>Активные ({len(emp_tasks)}):</b>")
@@ -2140,7 +2421,7 @@ async def cb_closed_tasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cb_export_dept_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Выбор периода для экспорта в Excel."""
     query = update.callback_query; await query.answer()
-    if not is_admin_check(query): return
+    if not is_strict_admin_check(query): return
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("Неделя", callback_data="export_week")],
         [InlineKeyboardButton("Месяц",  callback_data="export_month")],
@@ -2197,7 +2478,7 @@ def build_export_workbook(dept_filter: str, period: str):
 async def cb_export_period(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Формирует и отправляет xlsx-файл."""
     query = update.callback_query; await query.answer()
-    if not is_admin_check(query): return
+    if not is_strict_admin_check(query): return
     dept_filter = dept_filter_for(query)
     period = query.data.replace("export_", "", 1)  # week|month
 
@@ -2213,7 +2494,7 @@ async def cb_export_period(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cb_dynamics_dept(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Динамика выполнения задач по неделям — текстовый спарклайн за последние 4 недели."""
     query = update.callback_query; await query.answer()
-    if not is_admin_check(query): return
+    if not is_strict_admin_check(query): return
     dept_filter = dept_filter_for(query)
     all_t = tasks_all()
     if dept_filter:
@@ -2248,13 +2529,17 @@ async def cb_dynamics_dept(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ── NOTIFICATIONS ─────────────────────────────────────────────────────────────
 async def job_request_plans(bot: Bot):
+    logger.info("job_request_plans: triggered")
+    sent = 0
     for e in emp_employees():
         if has_plan_today(int(e["tg_id"])): continue
         try:
             await bot.send_message(int(e["tg_id"]),
                 f"☀️ Доброе утро, {e['full_name']}!\nНапиши план на день: /plan\n"
                 "Каждый пункт — отдельная задача в трекере.")
+            sent += 1
         except Exception as ex: logger.warning(f"request_plans: {ex}")
+    logger.info(f"job_request_plans: done, sent to {sent} employees")
 
 async def job_remind_plans(bot: Bot):
     for e in emp_employees():
@@ -2266,16 +2551,10 @@ async def job_remind_plans(bot: Bot):
 
 async def job_request_eod(bot: Bot):
     """19:00 — запускаем EOD-опрос для всех сотрудников."""
+    logger.info("job_request_eod: triggered")
     for e in emp_employees():
         await start_eod_flow(bot, int(e["tg_id"]))
-
-async def job_remind_reports(bot: Bot):
-    for e in emp_employees():
-        if not has_report_today(int(e["tg_id"])):
-            try:
-                await bot.send_message(int(e["tg_id"]),
-                    "🔔 Напоминание: напиши итоговый отчёт /report")
-            except Exception as ex: logger.warning(f"remind_reports: {ex}")
+    logger.info("job_request_eod: done")
 
 async def job_ping_deadlines(bot: Bot):
     for t in tasks_due_tomorrow():
@@ -2333,7 +2612,7 @@ async def job_daily_digest(bot: Bot):
     # ── Полная сводка в общий чат руководителей ──
     lines = [
         f"📊 <b>Сводка команды — {today}</b>",
-        f"Планов: {len(plan_ids)}/{len(employees)}   Отчётов: {len(report_ids)}/{len(employees)}   "
+        f"Планов: {len(plan_ids)}/{len(employees)}   EOD закрыт: {len(report_ids)}/{len(employees)}   "
         f"Закрыто задач: {len(done_today)}\n",
     ]
     for dept, emps in sorted(dept_employees.items()):
@@ -2368,14 +2647,14 @@ async def job_daily_digest(bot: Bot):
             f"Закрыто задач: {len(dept_done)}",
         ]
         if no_plan:   h_lines.append(f"❌ <b>Нет плана:</b> {', '.join(no_plan)}")
-        if no_report: h_lines.append(f"❌ <b>Нет отчёта:</b> {', '.join(no_report)}")
+        if no_report: h_lines.append(f"❌ <b>День не закрыт (EOD):</b> {', '.join(no_report)}")
         if dept_over:
             h_lines.append(f"\n⚠️ <b>Просрочено в отделе: {len(dept_over)}</b>")
             for t in dept_over[:5]:
                 h_lines.append(f"  🔴 {t['assigned_to_name']}: {t['title']}")
         try:
             await bot.send_message(int(head["tg_id"]), "\n".join(h_lines),
-                                   parse_mode="HTML", reply_markup=build_admin_keyboard())
+                                   parse_mode="HTML", reply_markup=build_dept_head_keyboard())
         except Exception as ex:
             logger.warning(f"daily_digest dept_head {head['tg_id']}: {ex}")
 
@@ -2391,7 +2670,7 @@ async def job_weekly_audit(bot: Bot):
     done_w    = [t for t in all_t if t["status"]=="done" and _is_this_week(t.get("done_at",""), ws)]
     over      = tasks_overdue()
     lines = [f"📅 <b>Еженедельный аудит ({w0} — {w1})</b>\n",
-             f"Отчётов: {len(set(r['tg_id'] for r in reports_w))}/{len(employees)}",
+             f"EOD закрыт: {len(set(r['tg_id'] for r in reports_w))}/{len(employees)}",
              f"Задач выполнено: {len(done_w)}", f"Просроченных: {len(over)}\n",
              "<b>По сотрудникам:</b>"]
     for e in employees:
@@ -2440,12 +2719,14 @@ def _is_this_week(dt_str, iso_week):
 def build_scheduler(bot: Bot):
     s = AsyncIOScheduler(timezone=APZ)
     def j(fn, **kw):
-        s.add_job(fn, CronTrigger(timezone=APZ, **kw), args=[bot])
+        # misfire_grace_time=900 (15 минут): если контейнер перезапускался (redeploy)
+        # ровно в момент срабатывания задания, APScheduler всё равно выполнит его
+        # в течение 15 минут после восстановления, а не молча пропустит до следующего дня.
+        s.add_job(fn, CronTrigger(timezone=APZ, **kw), args=[bot], misfire_grace_time=900)
     j(job_request_plans,   day_of_week="mon-fri", hour=11, minute=0)
     j(job_remind_plans,    day_of_week="mon-fri", hour=11, minute=30)
     j(job_ping_deadlines,  day_of_week="mon-fri", hour=10, minute=0)
     j(job_request_eod,     day_of_week="mon-fri", hour=19, minute=0)
-    j(job_remind_reports,  day_of_week="mon-fri", hour=19, minute=30)
     j(job_daily_digest,    day_of_week="mon-fri", hour=19, minute=35)
     j(job_weekly_audit,    day_of_week="fri",     hour=18, minute=0)
     j(job_monthly_audit,   day=28,                hour=17, minute=0)
@@ -2460,14 +2741,13 @@ async def post_init(app):
         ("start",     "Регистрация / меню"),
         ("ping",      "Проверка что бот на связи"),
         ("plan",      "План на день — поддерживает [ДД.ММ.ГГГГ] для другого срока"),
-        ("report",    "Итоговый отчёт за день"),
         ("eod",       "Закрыть день — статусы задач"),
         ("task",      "Поставить задачу — выбор отдела и сотрудника кнопками"),
         ("tag",       "Тег канала для задачи: /tag — выбор кнопками"),
         ("mytasks",   "Мои активные задачи"),
         ("done",      "Выполнено: /done ID"),
         ("status",    "Статус: /status ID"),
-        ("edit",      "Изменить задачу: /edit ID title|deadline значение"),
+        ("edit",      "Изменить задачу — выбор кнопками"),
         ("menu",      "Панель руководителя с кнопками"),
         ("team",      "Сводка команды"),
         ("tasks_all", "Все задачи"),
@@ -2506,11 +2786,6 @@ def main():
     app.add_handler(ConversationHandler(
         entry_points=[CommandHandler("plan", cmd_plan)],
         states={S_PLAN: [MessageHandler(filters.TEXT & ~filters.COMMAND, recv_plan)]},
-        fallbacks=[cancel],
-    ))
-    app.add_handler(ConversationHandler(
-        entry_points=[CommandHandler("report", cmd_report)],
-        states={S_REPORT: [MessageHandler(filters.TEXT & ~filters.COMMAND, recv_report)]},
         fallbacks=[cancel],
     ))
     app.add_handler(ConversationHandler(
@@ -2556,7 +2831,12 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_reg_dept,            pattern="^reg_dept_"))
     app.add_handler(CallbackQueryHandler(cb_admset_head,         pattern="^admset_head_"))
     app.add_handler(CallbackQueryHandler(cb_admset_dept,         pattern="^admset_dept_"))
+    app.add_handler(CallbackQueryHandler(cb_setdeptemp_pick,     pattern="^setdeptemp_"))
+    app.add_handler(CallbackQueryHandler(cb_donetask_pick,       pattern="^donetask_"))
+    app.add_handler(CallbackQueryHandler(cb_edittask_pick,       pattern="^edittask_"))
+    app.add_handler(CallbackQueryHandler(cb_editfield_pick,      pattern="^editfield_"))
     app.add_handler(CallbackQueryHandler(cb_eod_status,          pattern="^eods_"))
+    app.add_handler(CallbackQueryHandler(cb_eod_channel,         pattern="^eodchannel_"))
     app.add_handler(CallbackQueryHandler(cb_eod_extra_yes,       pattern="^eod_extra_yes$"))
     app.add_handler(CallbackQueryHandler(cb_eod_extra_no,        pattern="^eod_extra_no$"))
     app.add_handler(CallbackQueryHandler(cb_back_main,           pattern="^back_main$"))
@@ -2572,6 +2852,12 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_export_dept_pick,    pattern="^export_dept_pick$"))
     app.add_handler(CallbackQueryHandler(cb_export_period,       pattern="^export_(week|month)$"))
     app.add_handler(CallbackQueryHandler(cb_dynamics_dept,       pattern="^dynamics_dept$"))
+    app.add_handler(CallbackQueryHandler(cb_overdue_pick,         pattern="^overdue_pick$"))
+    app.add_handler(CallbackQueryHandler(cb_overdue_done,         pattern="^overduedone_"))
+    app.add_handler(CallbackQueryHandler(cb_overdue_move_pick,    pattern="^overduemove_"))
+    app.add_handler(CallbackQueryHandler(cb_overdue_set_deadline, pattern="^overduesetdl_"))
+    app.add_handler(CallbackQueryHandler(cb_remind_task_pick,    pattern="^remind_task_pick$"))
+    app.add_handler(CallbackQueryHandler(cb_remind_task_send,    pattern="^remindtask_"))
     app.add_handler(CallbackQueryHandler(cb_recover_period_pick, pattern="^recover_period_pick$"))
     app.add_handler(CallbackQueryHandler(cb_recover_run,         pattern=r"^recover_run_\d+$"))
     app.add_handler(CallbackQueryHandler(cb_checkstatuses_now,   pattern="^checkstatuses_now$"))
@@ -2581,9 +2867,9 @@ def main():
 
 # ── EOD TEXT ROUTER ───────────────────────────────────────────────────────────
 async def eod_text_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Роутер для текстовых ответов в EOD-потоке и в новом диалоговом /task."""
+    """Роутер для текстовых ответов в EOD-потоке, в /task и в /edit."""
     tg_id = update.effective_user.id
-    # Комментарий к задаче
+    # Обязательный комментарий к задаче после выбора канала
     if tg_id in ctx.bot_data.get("eod_pending_comment", {}):
         await recv_eod_comment(update, ctx)
         return
@@ -2594,6 +2880,10 @@ async def eod_text_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Новая задача после выбора сотрудника кнопками в /task
     if tg_id in ctx.bot_data.get("tasknew_pending", {}):
         await recv_tasknew_text(update, ctx)
+        return
+    # Новое значение поля после выбора кнопками в /edit
+    if tg_id in ctx.bot_data.get("edit_pending", {}):
+        await recv_edit_value(update, ctx)
         return
 
 if __name__ == "__main__":
