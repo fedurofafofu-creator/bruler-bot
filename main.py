@@ -1166,6 +1166,78 @@ async def cb_donetask_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_reply_markup(reply_markup=None)
     await _mark_task_done(query.message, ctx.bot, query.from_user.id, tid)
 
+async def cmd_changestatus(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    /changestatus — диалоговый выбор: своя активная задача кнопками →
+    любой из 4 статусов кнопками. Не запускает полный EOD-опрос по всем
+    задачам — меняет статус только одной выбранной, можно вызывать в
+    любой момент дня.
+    """
+    tg_id = update.effective_user.id
+    my_tasks = tasks_for_user(tg_id)
+    if not my_tasks:
+        await update.effective_message.reply_text("У тебя нет активных задач."); return
+    buttons = []
+    sl = {"open":"⬜","in_progress":"🔄","paused":"⏸"}
+    for t in my_tasks[:30]:
+        icon = sl.get(t["status"], "⚪")
+        label = f"{icon} {t['title'][:38]}" + ("…" if len(t['title']) > 38 else "")
+        buttons.append([InlineKeyboardButton(label, callback_data=f"chstatustask_{t['task_id']}")])
+    await update.effective_message.reply_text(
+        "Какой задаче сменить статус?",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+async def cb_changestatus_task_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Выбрана задача — показываем 4 кнопки статуса (отдельный callback-префикс,
+    не пересекается с EOD-потоком)."""
+    query = update.callback_query; await query.answer()
+    tid = query.data.replace("chstatustask_", "", 1)
+    task = task_by_id(tid)
+    if not task:
+        await query.message.reply_text("Задача не найдена."); return
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Выполнено",     callback_data=f"chstatus_done_{tid}"),
+            InlineKeyboardButton("🔄 В работе",      callback_data=f"chstatus_in_progress_{tid}"),
+        ],
+        [
+            InlineKeyboardButton("⏸ Приостановлено", callback_data=f"chstatus_paused_{tid}"),
+            InlineKeyboardButton("⬜ Не начато",      callback_data=f"chstatus_open_{tid}"),
+        ],
+    ])
+    await query.message.reply_text(
+        f"Новый статус для:\n<b>{task['title']}</b>",
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+
+async def cb_changestatus_apply(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Применяем выбранный статус к задаче — без захода в полный EOD-поток."""
+    query = update.callback_query
+    parts = query.data.split("_")
+    task_id = parts[-1]
+    status = "_".join(parts[1:-1])  # handles in_progress
+
+    task = task_by_id(task_id)
+    if not task:
+        await query.answer("Задача не найдена.", show_alert=True); return
+    tg_id = query.from_user.id
+    if str(task["assigned_to_id"]) != str(tg_id) and not emp_is_admin(tg_id):
+        await query.answer("⛔ Это не твоя задача.", show_alert=True); return
+
+    task_update_status(task_id, status)
+    status_labels = {
+        "done": "✅ Выполнено", "in_progress": "🔄 В работе",
+        "paused": "⏸ Приостановлено", "open": "⬜ Не начато"
+    }
+    label = status_labels.get(status, status)
+    await query.answer(f"Статус: {label}")
+    await query.edit_message_text(
+        f"<b>{task['title']}</b>\nНовый статус: {label}",
+        parse_mode="HTML"
+    )
+
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args:
         await update.effective_message.reply_text("Укажи ID: /status ABCD1234"); return
@@ -1390,6 +1462,7 @@ async def cmd_mytasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         src = " <i>(план)</i>" if t.get("source") == "plan" else ""
         tag = f" 🏷{t['channel']}" if t.get("channel") else ""
         lines.append(f"{sl.get(t['status'],'⚪')} <code>{t['task_id']}</code> {t['title']} — до {dl_fmt}{src}{tag}")
+    lines.append("\n🔄 /changestatus — сменить статус задачи\n✅ /done — отметить выполненной")
     await reply_long_text(update.effective_message, lines, parse_mode="HTML")
 
 # ── ADMIN KEYBOARD ────────────────────────────────────────────────────────────
@@ -2746,6 +2819,7 @@ async def post_init(app):
         ("tag",       "Тег канала для задачи: /tag — выбор кнопками"),
         ("mytasks",   "Мои активные задачи"),
         ("done",      "Выполнено: /done ID"),
+        ("changestatus", "Сменить статус задачи — выбор кнопками"),
         ("status",    "Статус: /status ID"),
         ("edit",      "Изменить задачу — выбор кнопками"),
         ("menu",      "Панель руководителя с кнопками"),
@@ -2802,6 +2876,7 @@ def main():
 
     app.add_handler(CommandHandler("eod",       cmd_eod))
     app.add_handler(CommandHandler("done",      cmd_done))
+    app.add_handler(CommandHandler("changestatus", cmd_changestatus))
     app.add_handler(CommandHandler("status",    cmd_status))
     app.add_handler(CommandHandler("mytasks",   cmd_mytasks))
     app.add_handler(CommandHandler("menu",      cmd_menu))
@@ -2833,6 +2908,8 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_admset_dept,         pattern="^admset_dept_"))
     app.add_handler(CallbackQueryHandler(cb_setdeptemp_pick,     pattern="^setdeptemp_"))
     app.add_handler(CallbackQueryHandler(cb_donetask_pick,       pattern="^donetask_"))
+    app.add_handler(CallbackQueryHandler(cb_changestatus_task_pick, pattern="^chstatustask_"))
+    app.add_handler(CallbackQueryHandler(cb_changestatus_apply,     pattern="^chstatus_"))
     app.add_handler(CallbackQueryHandler(cb_edittask_pick,       pattern="^edittask_"))
     app.add_handler(CallbackQueryHandler(cb_editfield_pick,      pattern="^editfield_"))
     app.add_handler(CallbackQueryHandler(cb_eod_status,          pattern="^eods_"))
