@@ -173,7 +173,7 @@ def safe_records(ws, headers):
     """
     cache_key = ws.title
     cached = _data_cache.get(cache_key)
-    if cached and (datetime.now() - cached[0]).total_seconds() < DATA_CACHE_TTL:
+    if cached and (datetime.now(TZ) - cached[0]).total_seconds() < DATA_CACHE_TTL:
         return cached[1]
 
     last_error = None
@@ -190,7 +190,7 @@ def safe_records(ws, headers):
                     elif len(row) > n:
                         row = row[:n]
                     result.append({headers[i]: row[i] for i in range(n)})
-            _data_cache[cache_key] = (datetime.now(), result)
+            _data_cache[cache_key] = (datetime.now(TZ), result)
             return result
         except gspread.exceptions.APIError as e:
             last_error = e
@@ -274,7 +274,7 @@ def emp_register(tg_id, username, full_name, role="employee", department=""):
     if emp_registered(tg_id):
         return False
     emp_sheet().append_row([tg_id, username or "", full_name, role,
-                             datetime.now().strftime("%Y-%m-%d %H:%M"), department, "", ""])
+                             datetime.now(TZ).strftime("%Y-%m-%d %H:%M"), department, "", ""])
     invalidate_cache("employees")
     return True
 
@@ -359,17 +359,24 @@ def plans_sheet():
 def reports_sheet():
     ws = sheet("reports"); ensure_headers(ws, RH); return ws
 
+def today_date():
+    """Текущая дата по московскому времени, как объект date (не datetime).
+    Использовать вместо date.today() везде в проекте — date.today() наивный
+    и берёт дату по таймзоне сервера (UTC на Railway), что давало расхождение
+    с реальным московским временем до 3 часов на границе суток."""
+    return datetime.now(TZ).date()
+
 def today_str():
-    return date.today().strftime("%Y-%m-%d")
+    return datetime.now(TZ).strftime("%Y-%m-%d")
 
 def save_plan(tg_id, name, text):
     plans_sheet().append_row([today_str(), tg_id, name, text,
-                               datetime.now().strftime("%Y-%m-%d %H:%M")])
+                               datetime.now(TZ).strftime("%Y-%m-%d %H:%M")])
     invalidate_cache("plans")
 
 def save_report(tg_id, name, text):
     reports_sheet().append_row([today_str(), tg_id, name, text,
-                                 datetime.now().strftime("%Y-%m-%d %H:%M")])
+                                 datetime.now(TZ).strftime("%Y-%m-%d %H:%M")])
     invalidate_cache("reports")
 
 def plans_today():
@@ -414,7 +421,7 @@ def workday_mark_start(tg_id, full_name):
     if workday_started(tg_id):
         return False
     ws = workday_sheet()
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    now = datetime.now(TZ).strftime("%Y-%m-%d %H:%M")
     ws.append_row([today_str(), tg_id, full_name, now, ""])
     invalidate_cache("workday")
     return True
@@ -427,14 +434,14 @@ def workday_mark_end(tg_id):
         if str(r["tg_id"]) == str(tg_id) and r["date"] == today_str():
             if r.get("end_at"):
                 return False  # уже отмечен
-            ws.update_cell(i, WH.index("end_at") + 1, datetime.now().strftime("%Y-%m-%d %H:%M"))
+            ws.update_cell(i, WH.index("end_at") + 1, datetime.now(TZ).strftime("%Y-%m-%d %H:%M"))
             invalidate_cache("workday")
             return True
     return False
 
 def records_for_week(ws_name, headers):
     ws = sheet(ws_name)
-    iso = datetime.now().strftime("%Y-W%W")
+    iso = datetime.now(TZ).strftime("%Y-W%W")
     result = []
     for r in safe_records(ws, headers):
         try:
@@ -447,7 +454,7 @@ def records_for_week(ws_name, headers):
 
 def records_for_month(ws_name, headers):
     ws = sheet(ws_name)
-    month = datetime.now().strftime("%Y-%m")
+    month = datetime.now(TZ).strftime("%Y-%m")
     return [r for r in safe_records(ws, headers) if r.get("date","").startswith(month)]
 
 def reports_for_period(date_from, date_to):
@@ -552,6 +559,7 @@ def format_commands_text(role: str) -> str:
 LEARN_SCENARIOS = [
     {
         "id": "startday", "role": "employee", "label": "☀️ Как начать рабочий день", "version": 1,
+        "blurb": "Отмечаешь начало дня — бот сразу спрашивает план.",
         "text": (
             "☀️ <b>Как начать рабочий день</b>\n\n"
             "Отметь начало рабочего дня командой /startday в любой момент,"
@@ -566,6 +574,7 @@ LEARN_SCENARIOS = [
     },
     {
         "id": "plan", "role": "employee", "label": "📝 Как написать план", "version": 2,
+        "blurb": "Пишешь список дел — каждая строка становится задачей.",
         "text": (
             "📝 <b>Как написать план</b>\n\n"
             "План запрашивается сразу после того, как ты отметил(а) начало "
@@ -582,6 +591,7 @@ LEARN_SCENARIOS = [
     },
     {
         "id": "eod", "role": "employee", "label": "✅ Как закрыть день", "version": 2,
+        "blurb": "Проходишь по задачам, отмечаешь статус каждой, закрываешь день.",
         "text": (
             "✅ <b>Как закрыть день</b>\n\n"
             "Отметь конец рабочего дня командой /endday — это запустит опрос "
@@ -596,6 +606,7 @@ LEARN_SCENARIOS = [
     },
     {
         "id": "task", "role": "employee", "label": "📌 Как поставить задачу", "version": 1,
+        "blurb": "Поручаешь дело коллеге — он получает уведомление сразу.",
         "text": (
             "📌 <b>Как поставить задачу</b>\n\n"
             "Напиши /task → выбери отдел кнопкой → выбери сотрудника кнопкой →\n"
@@ -605,16 +616,27 @@ LEARN_SCENARIOS = [
         "try_cmd": "/task",
     },
     {
-        "id": "tag", "role": "employee", "label": "🏷 Как тегировать канал", "version": 1,
+        "id": "tag", "role": "employee", "label": "🏷 Как тегировать канал", "version": 2,
+        "blurb": "Привязываешь задачу к каналу продаж — или ставишь «Не применимо».",
         "text": (
             "🏷 <b>Как тегировать канал</b>\n\n"
             "Напиши /tag → выбери задачу из списка → выбери канал продаж кнопкой.\n\n"
-            "Каналы: Сайт, Маркетплейсы, Комиссионеры, Опт, Розница, Bruler Studio, Не применимо."
+            "Каналы: Сайт, Маркетплейсы, Комиссионеры, Опт, Розница, Bruler Studio.\n\n"
+            "<i>Правило выбора:</i>\n"
+            "— Если у задачи есть чёткая принадлежность к конкретному каналу "
+            "продаж (например «Согласовать КП для Wildberries» → Маркетплейсы) "
+            "— выбираешь этот канал.\n"
+            "— Если задача не связана с конкретным каналом (внутренняя "
+            "встреча, административная работа, общая задача не про продажи) "
+            "— выбираешь <b>«Не применимо»</b>.\n\n"
+            "<i>Подсказка: не угадывай и не оставляй пустым — если сомневаешься,"
+            " «Не применимо» лучше, чем случайный канал.</i>"
         ),
         "try_cmd": "/tag",
     },
     {
         "id": "changestatus", "role": "employee", "label": "🔄 Как сменить статус задачи", "version": 1,
+        "blurb": "Меняешь статус одной задачи прямо сейчас, без полного EOD.",
         "text": (
             "🔄 <b>Как сменить статус задачи</b>\n\n"
             "Напиши /changestatus → выбери задачу → выбери новый статус кнопкой.\n\n"
@@ -624,6 +646,7 @@ LEARN_SCENARIOS = [
     },
     {
         "id": "menu", "role": "dept_head", "label": "🎛 Как пользоваться панелью", "version": 1,
+        "blurb": "Смотришь задачи, просрочки и отчётность своего отдела.",
         "text": (
             "🎛 <b>Как пользоваться панелью /menu</b>\n\n"
             "Открывает кнопки: задачи отдела, просроченные, отчётность по сотрудникам,\n"
@@ -633,6 +656,7 @@ LEARN_SCENARIOS = [
     },
     {
         "id": "remind", "role": "dept_head", "label": "🔔 Как напомнить о задаче", "version": 1,
+        "blurb": "Подталкиваешь сотрудника по конкретной задаче, выбрав её из списка.",
         "text": (
             "🔔 <b>Как напомнить сотруднику о задаче</b>\n\n"
             "В /menu нажми «🔔 Напомнить о задаче» → выбери задачу из списка отдела.\n\n"
@@ -642,6 +666,7 @@ LEARN_SCENARIOS = [
     },
     {
         "id": "export", "role": "admin", "label": "📥 Как выгрузить отчёт", "version": 1,
+        "blurb": "Получаешь Excel-файл со всеми задачами компании за период.",
         "text": (
             "📥 <b>Как выгрузить отчёт в Excel</b>\n\n"
             "В /menu нажми «📥 Экспорт отдела» → выбери период (неделя/месяц).\n\n"
@@ -696,7 +721,7 @@ def learning_find_or_create_row(tg_id, full_name, role, department) -> int:
     for i, r in enumerate(records, start=2):
         if str(r["tg_id"]) == str(tg_id):
             return i
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    now = datetime.now(TZ).strftime("%Y-%m-%d %H:%M")
     blank_row = [tg_id, full_name, role, department, now, "", ""] + [""] * len(LEARN_SCENARIOS)
     ws.append_row(blank_row)
     invalidate_cache("learning_progress")
@@ -750,7 +775,7 @@ def learning_mark_done(tg_id, full_name, scenario_id, version):
         if m and int(m.group(1)) >= version:
             return
 
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    now = datetime.now(TZ).strftime("%Y-%m-%d %H:%M")
     ws.update_cell(row, col_index, learning_format_cell(version, now))
     invalidate_cache("learning_progress")
 
@@ -913,7 +938,7 @@ def tasks_overdue():
             if r["status"] not in ("done",) and r.get("deadline","") and r["deadline"] < today]
 
 def tasks_due_tomorrow():
-    tmr = (date.today() + timedelta(days=1)).strftime("%Y-%m-%d")
+    tmr = (today_date() + timedelta(days=1)).strftime("%Y-%m-%d")
     return [r for r in tasks_all_real() if r.get("deadline") == tmr and r["status"] != "done"]
 
 def tasks_due_today_list():
@@ -930,7 +955,7 @@ def task_create(by_id, by_name, to_id, to_name, title, deadline, source="manual"
     tid = str(uuid.uuid4())[:8].upper()
     tasks_sheet().append_row([
         tid, by_id, by_name, to_id, to_name, title,
-        deadline, "open", datetime.now().strftime("%Y-%m-%d %H:%M"),
+        deadline, "open", datetime.now(TZ).strftime("%Y-%m-%d %H:%M"),
         "", "", "", source, channel, "TRUE" if is_training else ""
     ])
     invalidate_cache("tasks")
@@ -949,7 +974,7 @@ def task_update_status(tid, status):
     ws = tasks_sheet()
     ws.update_cell(row, TH.index("status") + 1, status)
     if status == "done":
-        ws.update_cell(row, TH.index("done_at") + 1, datetime.now().strftime("%Y-%m-%d %H:%M"))
+        ws.update_cell(row, TH.index("done_at") + 1, datetime.now(TZ).strftime("%Y-%m-%d %H:%M"))
     invalidate_cache("tasks")
     return True
 
@@ -1377,7 +1402,7 @@ def pop_learning_continue_keyboard(tg_id):
     role = u["role"]
     if learning_is_complete(tg_id, role):
         delete_training_tasks(tg_id)
-        learning_set_field(tg_id, "completed_at", datetime.now().strftime("%Y-%m-%d %H:%M"))
+        learning_set_field(tg_id, "completed_at", datetime.now(TZ).strftime("%Y-%m-%d %H:%M"))
         return InlineKeyboardMarkup([[
             InlineKeyboardButton("🎉 Посмотреть итог", callback_data="learn_main"),
         ]])
@@ -2164,7 +2189,7 @@ def calc_streak(tg_id: int) -> int:
             by_date.setdefault(d, []).append(t)
 
     streak = 0
-    day = date.today()
+    day = today_date()
     # сегодняшний день не считаем, если он ещё не закрыт — начинаем со вчера
     while True:
         d_str = day.strftime("%Y-%m-%d")
@@ -2172,7 +2197,7 @@ def calc_streak(tg_id: int) -> int:
         if day_tasks is None:
             # нет задач в этот день — пропускаем день, не прерывая стрик (выходной/отсутствие плана)
             day -= timedelta(days=1)
-            if (date.today() - day).days > 60:
+            if (today_date() - day).days > 60:
                 break
             continue
         if all(t["status"] == "done" for t in day_tasks):
@@ -2375,7 +2400,7 @@ async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text("⛔ Только для руководителей.")
         return
     dept_filter = emp_managed_dept(tg_id)  # "" для admin, название отдела для dept_head
-    today = date.today().strftime("%d.%m.%Y")
+    today = today_date().strftime("%d.%m.%Y")
     employees = emp_employees()
     if dept_filter:
         employees = [e for e in employees if get_dept(e["tg_id"]) == dept_filter]
@@ -2724,7 +2749,7 @@ async def cmd_team(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     plan_ids  = {str(p["tg_id"]) for p in plans_today()}
     report_ids = {str(r["tg_id"]) for r in reports_today()}
     dept_label = f" — {dept_filter}" if dept_filter else ""
-    lines = [f"📊 <b>Команда{dept_label} {datetime.now().strftime('%d.%m.%Y')}:</b>\n"]
+    lines = [f"📊 <b>Команда{dept_label} {datetime.now(TZ).strftime('%d.%m.%Y')}:</b>\n"]
     for e in employees:
         tid = str(e["tg_id"])
         lines.append(
@@ -2843,8 +2868,8 @@ async def cmd_recovertasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if ctx.args and ctx.args[0].isdigit():
         days_back = int(ctx.args[0])
 
-    date_to = date.today().strftime("%Y-%m-%d")
-    date_from = (date.today() - timedelta(days=days_back)).strftime("%Y-%m-%d")
+    date_to = today_date().strftime("%Y-%m-%d")
+    date_from = (today_date() - timedelta(days=days_back)).strftime("%Y-%m-%d")
 
     await update.effective_message.reply_text(
         f"🔧 Сканирую планы с {date_from} по {date_to}..."
@@ -2942,12 +2967,13 @@ async def cb_learn_main(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     lines = ["📚 <b>Твой прогресс обучения:</b>\n"]
     for i, s in enumerate(sequence):
+        blurb = s.get("blurb", "")
         if i < current_idx:
-            lines.append(f"✅ {s['label']}")
+            lines.append(f"✅ {s['label']}\n    <i>{blurb}</i>")
         elif i == current_idx:
-            lines.append(f"▶️ {s['label']} — текущий шаг")
+            lines.append(f"▶️ {s['label']} — текущий шаг\n    <i>{blurb}</i>")
         else:
-            lines.append(f"🔒 {s['label']}")
+            lines.append(f"🔒 {s['label']}\n    <i>{blurb}</i>")
 
     current = sequence[current_idx]
     keyboard = InlineKeyboardMarkup([[
@@ -3046,7 +3072,7 @@ async def cb_overdue_move_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
     if not is_admin_check(query): return
     tid = query.data.replace("overduemove_", "", 1)
-    today = date.today()
+    today = today_date()
     options = [
         ("Сегодня", today),
         ("Завтра", today + timedelta(days=1)),
@@ -3233,8 +3259,8 @@ async def cb_recover_run(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     dept_filter = dept_filter_for(query)
 
     days_back = int(query.data.replace("recover_run_", "", 1))
-    date_to = date.today().strftime("%Y-%m-%d")
-    date_from = (date.today() - timedelta(days=days_back)).strftime("%Y-%m-%d")
+    date_to = today_date().strftime("%Y-%m-%d")
+    date_from = (today_date() - timedelta(days=days_back)).strftime("%Y-%m-%d")
 
     recovered, by_person, affected_dates = recover_tasks_from_plans(date_from, date_to, dept_filter)
 
@@ -3270,8 +3296,8 @@ async def cb_tasks_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
     if not is_admin_check(query): return
     dept_filter = dept_filter_for(query)
-    today = date.today().strftime("%Y-%m-%d")
-    today_fmt = date.today().strftime("%d.%m.%Y")
+    today = today_date().strftime("%Y-%m-%d")
+    today_fmt = today_date().strftime("%d.%m.%Y")
     tasks = tasks_for_date(today)
     over = tasks_overdue()
     if dept_filter:
@@ -3344,7 +3370,7 @@ async def cb_summary_depts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     plan_ids   = {str(p["tg_id"]) for p in plans_today()}
     report_ids = {str(r["tg_id"]) for r in reports_today()}
     all_t = tasks_all_real()
-    today = today_str(); today_fmt = date.today().strftime("%d.%m.%Y")
+    today = today_str(); today_fmt = today_date().strftime("%d.%m.%Y")
     dept_employees: dict = {}
     for e in employees:
         dept = get_dept(e["tg_id"])
@@ -3398,7 +3424,7 @@ async def cb_summary_person(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("Не найден."); return
     if dept_filter and get_dept(tg_id) != dept_filter:
         await query.answer("⛔ Сотрудник не из твоего отдела.", show_alert=True); return
-    today = today_str(); today_fmt = date.today().strftime("%d.%m.%Y")
+    today = today_str(); today_fmt = today_date().strftime("%d.%m.%Y")
     plan_ids   = {str(p["tg_id"]) for p in plans_today()}
     report_ids = {str(r["tg_id"]) for r in reports_today()}
     all_t = tasks_all_real()
@@ -3433,7 +3459,7 @@ async def cb_period_week(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
     if not is_admin_check(query): return
     dept_filter = dept_filter_for(query)
-    today = date.today()
+    today = today_date()
     week_start = (today - timedelta(days=today.weekday())).strftime("%Y-%m-%d")
     week_end   = today.strftime("%Y-%m-%d")
     week_start_fmt = (today - timedelta(days=today.weekday())).strftime("%d.%m")
@@ -3475,7 +3501,7 @@ async def cb_period_month(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
     if not is_admin_check(query): return
     dept_filter = dept_filter_for(query)
-    today = date.today()
+    today = today_date()
     month_start = today.replace(day=1).strftime("%Y-%m-%d")
     month_end   = today.strftime("%Y-%m-%d")
     month_label = today.strftime("%B %Y")
@@ -3532,7 +3558,7 @@ async def cb_closed_tasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin_check(query): return
     dept_filter = dept_filter_for(query)
     period = query.data.replace("closed_", "", 1)  # today|week|month
-    today = date.today()
+    today = today_date()
     if period == "today":
         start = today.strftime("%Y-%m-%d")
         label = f"сегодня ({today.strftime('%d.%m.%Y')})"
@@ -3584,7 +3610,7 @@ async def cb_export_dept_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 def build_export_workbook(dept_filter: str, period: str):
     """Строит .xlsx с задачами за период, фильтр по отделу опционален."""
-    today = date.today()
+    today = today_date()
     if period == "week":
         start = (today - timedelta(days=today.weekday())).strftime("%Y-%m-%d")
         label = f"неделя с {(today - timedelta(days=today.weekday())).strftime('%d.%m.%Y')}"
@@ -3637,7 +3663,7 @@ async def cb_export_period(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     buf, label = build_export_workbook(dept_filter, period)
     dept_part = dept_filter.replace(" ", "_") if dept_filter else "all"
-    filename = f"report_{dept_part}_{date.today().strftime('%Y%m%d')}.xlsx"
+    filename = f"report_{dept_part}_{today_date().strftime('%Y%m%d')}.xlsx"
 
     await query.message.reply_document(
         document=InputFile(buf, filename=filename),
@@ -3653,7 +3679,7 @@ async def cb_dynamics_dept(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if dept_filter:
         all_t = [t for t in all_t if get_dept(t["assigned_to_id"]) == dept_filter]
 
-    today = date.today()
+    today = today_date()
     weeks = []
     for i in range(3, -1, -1):
         w_start = today - timedelta(days=today.weekday() + i*7)
@@ -3761,7 +3787,7 @@ async def job_learning_reminder(bot: Bot):
     дней с начала — сбрасывает прогресс и удаляет тренажёрные задачи, чтобы
     не копился незавершённый мусор в листах tasks и learning_progress.
     """
-    today = date.today()
+    today = today_date()
     for r in learning_abandoned_employees():
         tg_id = int(r["tg_id"])
         working_days = count_working_days_between(r.get("started_at", ""), today)
@@ -3799,7 +3825,7 @@ async def job_learning_reminder(bot: Bot):
                 "прогресс и тестовые задачи будут сброшены.\n\n"
                 "Напиши /start или нажми «📚 Обучение» в /menu, чтобы продолжить."
             )
-            learning_set_field(tg_id, "last_reminder_at", datetime.now().strftime("%Y-%m-%d %H:%M"))
+            learning_set_field(tg_id, "last_reminder_at", datetime.now(TZ).strftime("%Y-%m-%d %H:%M"))
         except Exception as ex:
             logger.warning(f"learning_reminder {tg_id}: {ex}")
 
@@ -3841,7 +3867,7 @@ async def job_ping_deadlines(bot: Bot):
             logger.warning(f"overdue notify dept_head {head['tg_id']}: {ex}")
 
 async def job_daily_digest(bot: Bot):
-    today = datetime.now().strftime("%d.%m.%Y")
+    today = datetime.now(TZ).strftime("%d.%m.%Y")
     employees = emp_employees()
     p_list = plans_today(); r_list = reports_today()
     plan_ids   = {str(p["tg_id"]) for p in p_list}
@@ -3849,7 +3875,7 @@ async def job_daily_digest(bot: Bot):
     all_t = tasks_all_real()
     over = tasks_overdue()
     done_today = [t for t in all_t if t["status"] == "done"
-                  and t.get("done_at","").startswith(datetime.now().strftime("%Y-%m-%d"))]
+                  and t.get("done_at","").startswith(datetime.now(TZ).strftime("%Y-%m-%d"))]
 
     # группируем сотрудников по отделам
     dept_employees: dict = {}
@@ -3929,7 +3955,7 @@ async def job_daily_digest(bot: Bot):
             logger.warning(f"daily_digest founder {f['tg_id']}: {ex}")
 
 async def job_weekly_audit(bot: Bot):
-    now = datetime.now()
+    now = datetime.now(TZ)
     ws = now.strftime("%Y-W%W")
     w0 = (now - timedelta(days=now.weekday())).strftime("%d.%m")
     w1 = now.strftime("%d.%m.%Y")
@@ -3956,7 +3982,7 @@ async def job_weekly_audit(bot: Bot):
     except Exception as ex: logger.warning(f"weekly_audit: {ex}")
 
 async def job_monthly_audit(bot: Bot):
-    now = datetime.now()
+    now = datetime.now(TZ)
     month = now.strftime("%Y-%m"); month_label = now.strftime("%B %Y")
     _, last = calendar.monthrange(now.year, now.month)
     wd = sum(1 for d in range(1, now.day+1) if datetime(now.year, now.month, d).weekday() < 5)
