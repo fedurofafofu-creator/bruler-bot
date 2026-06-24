@@ -1266,6 +1266,12 @@ async def cb_admset_head(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_plan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.callback_query:
         await update.callback_query.answer()
+        # learntry_plan — точка входа в ConversationHandler напрямую (см. main()),
+        # минует cb_learn_try, который единственный обычно выставляет флаг
+        # обучения. Без этой строки recv_plan ниже всегда считал бы is_training
+        # ложным, даже когда план запущен явно из карточки обучения.
+        if update.callback_query.data == "learntry_plan":
+            mark_learning_action(update.callback_query.from_user.id, "plan")
     if not emp_registered(update.effective_user.id):
         await update.effective_message.reply_text("Сначала /start")
         return ConversationHandler.END
@@ -1673,6 +1679,14 @@ async def cmd_startday(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """
     if update.callback_query:
         await update.callback_query.answer()
+        # Кнопка 'Попробовать /startday' из карточки обучения зарегистрирована
+        # как прямая точка входа в ConversationHandler (см. main()), минуя
+        # cb_learn_try целиком — поэтому mark_learning_action там никогда не
+        # вызывается для этого сценария. Выставляем флаг здесь явно, иначе
+        # шаг обучения никогда не засчитывается и пользователь застревает.
+        if update.callback_query.data == "learntry_startday":
+            mark_learning_action(update.callback_query.from_user.id, "startday")
+
     tg_id = update.effective_user.id
     if not emp_registered(tg_id):
         await update.effective_message.reply_text("Сначала /start"); return ConversationHandler.END
@@ -1740,6 +1754,10 @@ async def cmd_task(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """
     if update.callback_query:
         await update.callback_query.answer()
+        # Та же причина, что в cmd_plan/cmd_startday — learntry_task минует
+        # cb_learn_try, нужно выставить флаг обучения здесь явно.
+        if update.callback_query.data == "learntry_task":
+            mark_learning_action(update.callback_query.from_user.id, "task")
     if not emp_registered(update.effective_user.id):
         await update.effective_message.reply_text("Сначала /start")
         return ConversationHandler.END
