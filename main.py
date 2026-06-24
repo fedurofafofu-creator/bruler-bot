@@ -2965,15 +2965,19 @@ async def cb_learn_main(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("\n".join(lines), parse_mode="HTML")
         return
 
-    lines = ["📚 <b>Твой прогресс обучения:</b>\n"]
+    lines = ["📚 <b>Твой прогресс обучения</b>"]
+    lines.append(f"Пройдено: {current_idx} из {len(sequence)}\n")
     for i, s in enumerate(sequence):
-        blurb = s.get("blurb", "")
+        # убираем эмодзи самого шага из общего списка, чтобы не было
+        # двух значков подряд (статус + эмодзи названия) — оставляем
+        # только текстовое название без иконки-приставки
+        label_text = s["label"].split(" ", 1)[-1] if " " in s["label"] else s["label"]
         if i < current_idx:
-            lines.append(f"✅ {s['label']}\n    <i>{blurb}</i>")
+            lines.append(f"✅  {i+1}. {label_text}")
         elif i == current_idx:
-            lines.append(f"▶️ {s['label']} — текущий шаг\n    <i>{blurb}</i>")
+            lines.append(f"▶️  {i+1}. {label_text}")
         else:
-            lines.append(f"🔒 {s['label']}\n    <i>{blurb}</i>")
+            lines.append(f"⚪  {i+1}. {label_text}")
 
     current = sequence[current_idx]
     keyboard = InlineKeyboardMarkup([[
@@ -3022,7 +3026,7 @@ async def cb_learn_try(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     mark_learning_action(update.callback_query.from_user.id, scenario_id)
 
     dispatch = {
-        "plan": cmd_plan, "eod": cmd_eod, "task": cmd_task,
+        "startday": cmd_startday, "plan": cmd_plan, "eod": cmd_eod, "task": cmd_task,
         "tag": cmd_tag, "changestatus": cmd_changestatus, "menu": cmd_menu,
     }
     handler = dispatch.get(cmd)
@@ -4095,9 +4099,11 @@ def main():
             CallbackQueryHandler(cmd_plan, pattern="^learntry_plan$"),
             CommandHandler("startday", cmd_startday),
             CallbackQueryHandler(cmd_startday, pattern="^startday_btn$"),
+            CallbackQueryHandler(cmd_startday, pattern="^learntry_startday$"),
         ],
         states={S_PLAN: [MessageHandler(filters.TEXT & ~filters.COMMAND, recv_plan)]},
         fallbacks=[cancel],
+        per_message=False,
     ))
     app.add_handler(ConversationHandler(
         entry_points=[
@@ -4106,6 +4112,7 @@ def main():
         ],
         states={S_TASK: [MessageHandler(filters.TEXT & ~filters.COMMAND, recv_task)]},
         fallbacks=[cancel],
+        per_message=False,
     ))
 
     # EOD text handlers (не ConversationHandler — работают через bot_data флаги)
