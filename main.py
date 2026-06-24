@@ -2536,9 +2536,30 @@ async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"✅ Задач активных: {len(open_t)}\n"
         + (f"⚠️ Просроченных: {len(over)}\n" if over else "")
     )
+
+    # У /menu, в отличие от плана/задачи/EOD, нет естественной точки
+    # завершения — это открытый интерфейс с десятком кнопок, не разовое
+    # действие. Поэтому шаг обучения засчитывается сразу при открытии
+    # панели. Три разных сценария обучения ('menu', 'remind', 'export')
+    # все ведут сюда через try_cmd=/menu, у каждого свой callback_data —
+    # нужно проверить и засчитать именно тот, который реально привёл сюда.
+    learn_kb = None
+    if update.callback_query and update.callback_query.data in (
+        "learntry_menu", "learntry_remind", "learntry_export"
+    ):
+        scenario_id = update.callback_query.data.replace("learntry_", "", 1)
+        mark_learning_action(tg_id, scenario_id)
+        learn_kb = pop_learning_continue_keyboard(tg_id)
+
     await update.effective_message.reply_text(
         text, parse_mode="HTML", reply_markup=menu_keyboard_for(tg_id)
     )
+    if learn_kb:
+        await update.effective_message.reply_text(
+            "Панель открыта — можешь нажимать любые кнопки, попробовать их все. "
+            "Когда закончишь изучать — продолжи обучение:",
+            reply_markup=learn_kb
+        )
 
 async def cmd_fixsheets(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Аварийная команда: чинит заголовки во всех листах (принудительно, игнорируя кэш проверки)."""
