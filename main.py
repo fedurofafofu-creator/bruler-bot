@@ -211,7 +211,7 @@ def safe_records(ws, headers):
     raise last_error
 
 # ── EMPLOYEES ─────────────────────────────────────────────────────────────────
-EMP_H = ["tg_id","username","full_name","role","registered_at","department"]
+EMP_H = ["tg_id","username","full_name","role","registered_at","department","founder_digest_pref"]
 
 def emp_sheet():
     ws = sheet("employees"); ensure_headers(ws, EMP_H); return ws
@@ -247,17 +247,26 @@ def emp_is_dept_head(tg_id):
     r = emp_by_id(tg_id)
     return r is not None and r["role"] == "dept_head"
 
-def emp_has_management_access(tg_id):
-    """Полный доступ к панели (admin) или ограниченный (dept_head)."""
+def emp_is_founder(tg_id):
+    """Учредитель — read-only роль, видит всё по компании, не управляет ничем,
+    не проходит обучение, не пишет планы/отчёты, не получает напоминания
+    о задачах. Только просмотр результатов и сводок."""
     r = emp_by_id(tg_id)
-    return r is not None and r["role"] in ("admin", "dept_head")
+    return r is not None and r["role"] == "founder"
+
+def emp_has_management_access(tg_id):
+    """Полный доступ к панели на чтение: admin (полное управление),
+    dept_head (управление своим отделом) или founder (только просмотр,
+    без управляющих кнопок — see is_strict_admin_check и build_founder_keyboard)."""
+    r = emp_by_id(tg_id)
+    return r is not None and r["role"] in ("admin", "dept_head", "founder")
 
 def emp_managed_dept(tg_id) -> str:
-    """Отдел, который видит dept_head. Для admin — пусто (видит всё)."""
+    """Отдел, который видит dept_head. Для admin и founder — пусто (видят всё)."""
     r = emp_by_id(tg_id)
     if not r:
         return ""
-    if r["role"] == "admin":
+    if r["role"] in ("admin", "founder"):
         return ""
     return get_dept(tg_id)
 
@@ -265,7 +274,7 @@ def emp_register(tg_id, username, full_name, role="employee", department=""):
     if emp_registered(tg_id):
         return False
     emp_sheet().append_row([tg_id, username or "", full_name, role,
-                             datetime.now().strftime("%Y-%m-%d %H:%M"), department])
+                             datetime.now().strftime("%Y-%m-%d %H:%M"), department, ""])
     invalidate_cache("employees")
     return True
 
@@ -283,6 +292,17 @@ def emp_set_role(tg_id, role: str):
     for i, r in enumerate(safe_records(ws, EMP_H), start=2):
         if str(r["tg_id"]) == str(tg_id):
             ws.update_cell(i, EMP_H.index("role") + 1, role)
+            invalidate_cache("employees")
+            return True
+    return False
+
+def emp_set_founder_digest_pref(tg_id, pref: str):
+    """pref: 'manual' (только заходит сам), 'digest' (только авторассылка),
+    'both' (и то, и другое)."""
+    ws = emp_sheet()
+    for i, r in enumerate(safe_records(ws, EMP_H), start=2):
+        if str(r["tg_id"]) == str(tg_id):
+            ws.update_cell(i, EMP_H.index("founder_digest_pref") + 1, pref)
             invalidate_cache("employees")
             return True
     return False
@@ -371,7 +391,7 @@ def plans_for_period(date_from, date_to):
 # status: open | in_progress | done | paused | overdue
 TH = ["task_id","created_by_id","created_by_name","assigned_to_id",
       "assigned_to_name","title","deadline","status","created_at",
-      "done_at","comment","result_link","source","channel"]
+      "done_at","comment","result_link","source","channel","is_training"]
 
 CHANNEL_LIST = ["Сайт", "Маркетплейсы", "Комиссионеры", "Опт", "Розница", "Bruler Studio", "Не применимо"]
 
@@ -418,6 +438,7 @@ COMMAND_REGISTRY = [
         "items": [
             ("/setadmin", "выдать права администратора"),
             ("/setdepthead", "назначить руководителя отдела"),
+            ("/setfounder", "назначить учредителя"),
             ("/setdept", "сменить отдел сотрудника"),
             ("/recovertasks", "восстановить задачи из планов"),
             ("/fixname", "исправить имя сотрудника"),
@@ -532,26 +553,27 @@ LEARN_SCENARIOS = [
     },
 ]
 
+ROLE_LEARNING_SEQUENCE = {
+    "employee":  ["plan", "eod", "task", "tag", "changestatus"],
+    "dept_head": ["plan", "eod", "task", "tag", "changestatus", "menu", "remind"],
+    "admin":     ["plan", "eod", "task", "tag", "changestatus", "menu", "remind", "export"],
+}
+
 def learn_scenarios_for_role(role: str) -> list:
-    """Возвращает сценарии обучения, видимые для роли."""
-    visible_roles = {
-        "employee":  {"employee"},
-        "dept_head": {"employee", "dept_head"},
-        "admin":     {"employee", "dept_head", "admin"},
-    }.get(role, {"employee"})
-    return [s for s in LEARN_SCENARIOS if s["role"] in visible_roles]
+    """Возвращает сценарии в строго заданном порядке для роли (своя полная
+    последовательность для каждой роли, не общий список с надстройками)."""
+    sequence = ROLE_LEARNING_SEQUENCE.get(role, ROLE_LEARNING_SEQUENCE["employee"])
+    by_id = {s["id"]: s for s in LEARN_SCENARIOS}
+    return [by_id[sid] for sid in sequence if sid in by_id]
 
 # ── ЛИСТ ОБУЧЕНИЯ ─────────────────────────────────────────────────────────────
 # Широкая таблица: одна строка на сотрудника, один столбец на каждый сценарий
-# обучения. Ячейка содержит "✅ vN, ДД.ММ" если пройдено, иначе пусто.
-# Это даёт мгновенно читаемую картину прямо в Google Sheets — открыл таблицу
-# и видно, кто что изучил, без необходимости фильтровать длинный список строк.
-LH_FIXED = ["tg_id", "full_name", "role", "department"]  # фиксированные колонки
+# обучения + служебные колонки прогресса. Ячейка сценария содержит
+# "✅ vN, ДД.ММ" если пройдено, иначе пусто.
+LH_FIXED = ["tg_id", "full_name", "role", "department", "started_at", "completed_at", "last_reminder_at"]
 
 def learning_columns() -> list:
-    """Фиксированные колонки + одна колонка на каждый сценарий из LEARN_SCENARIOS,
-    в порядке их определения. Если добавляется новый сценарий — здесь сразу
-    появляется новая колонка при следующем вызове ensure_headers."""
+    """Фиксированные колонки + одна колонка на каждый сценарий из LEARN_SCENARIOS."""
     return LH_FIXED + [s["id"] for s in LEARN_SCENARIOS]
 
 def learning_sheet():
@@ -561,34 +583,53 @@ def learning_all() -> list:
     return safe_records(learning_sheet(), learning_columns())
 
 def learning_format_cell(version: int, completed_at: str) -> str:
-    """Человеко-читаемое содержимое ячейки: статус, версия, дата."""
     date_part = completed_at.split(" ")[0] if completed_at else ""
-    # переводим YYYY-MM-DD в ДД.ММ для краткости в ячейке
     if len(date_part) == 10:
         y, m, d = date_part.split("-")
         date_part = f"{d}.{m}"
     return f"✅ v{version}, {date_part}".strip(", ")
 
 def learning_find_or_create_row(tg_id, full_name, role, department) -> int:
-    """Находит строку сотрудника в таблице обучения или создаёт новую.
-    Возвращает 1-indexed номер строки в листе (с учётом заголовка)."""
+    """Находит строку сотрудника в таблице обучения или создаёт новую,
+    фиксируя started_at в момент первого обращения к обучению."""
     ws = learning_sheet()
     columns = learning_columns()
     records = safe_records(ws, columns)
     for i, r in enumerate(records, start=2):
         if str(r["tg_id"]) == str(tg_id):
             return i
-    # не нашли — создаём новую строку с пустыми статусами по всем сценариям
-    blank_row = [tg_id, full_name, role, department] + [""] * len(LEARN_SCENARIOS)
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    blank_row = [tg_id, full_name, role, department, now, "", ""] + [""] * len(LEARN_SCENARIOS)
     ws.append_row(blank_row)
     invalidate_cache("learning_progress")
-    return len(records) + 2  # +1 за заголовок, +1 за только что добавленную строку
+    return len(records) + 2
+
+def learning_get_row_dict(tg_id):
+    """Возвращает сырую строку прогресса (как словарь) или None, если сотрудник
+    ещё не начинал обучение."""
+    for r in learning_all():
+        if str(r["tg_id"]) == str(tg_id):
+            return r
+    return None
+
+def learning_set_field(tg_id, field, value):
+    """Записывает значение в служебную колонку (started_at/completed_at/last_reminder_at)."""
+    ws = learning_sheet()
+    columns = learning_columns()
+    if field not in columns:
+        return
+    col_index = columns.index(field) + 1
+    records = safe_records(ws, columns)
+    for i, r in enumerate(records, start=2):
+        if str(r["tg_id"]) == str(tg_id):
+            ws.update_cell(i, col_index, value)
+            invalidate_cache("learning_progress")
+            return
 
 def learning_mark_done(tg_id, full_name, scenario_id, version):
     """
-    Отмечает сценарий пройденным для сотрудника — записывает читаемый статус
-    прямо в соответствующую колонку. Если в этой колонке уже стоит версия
-    >= текущей — не перезаписывает (избегаем повторной записи той же отметки).
+    Отмечает сценарий пройденным для сотрудника. Если в этой колонке уже стоит
+    версия >= текущей — не перезаписывает.
     """
     u = emp_by_id(tg_id)
     role = u["role"] if u else "employee"
@@ -596,13 +637,12 @@ def learning_mark_done(tg_id, full_name, scenario_id, version):
 
     columns = learning_columns()
     if scenario_id not in columns:
-        return  # неизвестный сценарий, не должно происходить
-    col_index = columns.index(scenario_id) + 1  # 1-indexed для gspread
+        return
+    col_index = columns.index(scenario_id) + 1
 
     row = learning_find_or_create_row(tg_id, full_name, role, department)
     ws = learning_sheet()
 
-    # проверяем текущее значение ячейки, чтобы не перезаписывать более новую версию
     try:
         current = ws.cell(row, col_index).value or ""
     except Exception:
@@ -610,17 +650,15 @@ def learning_mark_done(tg_id, full_name, scenario_id, version):
     if current:
         m = re.search(r"v(\d+)", current)
         if m and int(m.group(1)) >= version:
-            return  # уже отмечена эта версия или новее
+            return
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     ws.update_cell(row, col_index, learning_format_cell(version, now))
     invalidate_cache("learning_progress")
 
 def learning_completed_versions(tg_id) -> dict:
-    """Возвращает {scenario_id: max_version_completed} для сотрудника,
-    разбирая читаемый текст ячеек обратно в числа версий."""
+    """Возвращает {scenario_id: max_version_completed} для сотрудника."""
     result = {}
-    columns = learning_columns()
     for r in learning_all():
         if str(r["tg_id"]) != str(tg_id):
             continue
@@ -635,20 +673,118 @@ def learning_completed_versions(tg_id) -> dict:
     return result
 
 def learning_pending_scenarios(tg_id, role: str) -> list:
-    """
-    Сценарии, которые сотрудник ещё не прошёл в актуальной версии —
-    либо никогда не открывал, либо открывал старую версию до обновления функции.
-    Это и есть механизм 'бот поменялся → направить на ознакомление заново'.
-    """
+    """Сценарии, которые сотрудник ещё не прошёл в актуальной версии."""
     completed = learning_completed_versions(tg_id)
     available = learn_scenarios_for_role(role)
     return [s for s in available if completed.get(s["id"], 0) < s["version"]]
+
+def learning_current_step_index(tg_id, role: str) -> int:
+    """
+    Возвращает индекс первого непройденного шага в последовательности роли
+    (0-indexed). Если все шаги пройдены — возвращает len(sequence), то есть
+    обучение полностью завершено. Это и есть механизм строгого порядка:
+    шаг N+1 недоступен, пока не пройден шаг N.
+    """
+    sequence = learn_scenarios_for_role(role)
+    completed = learning_completed_versions(tg_id)
+    for i, s in enumerate(sequence):
+        if completed.get(s["id"], 0) < s["version"]:
+            return i
+    return len(sequence)
+
+def learning_is_complete(tg_id, role: str) -> bool:
+    sequence = learn_scenarios_for_role(role)
+    return learning_current_step_index(tg_id, role) >= len(sequence)
+
+def learning_new_scenarios_since_completion(tg_id, role: str) -> list:
+    """
+    Для сотрудника, который ранее завершил всю последовательность на 100% —
+    сценарии с версией выше уже отмеченной, появившиеся ПОСЛЕ завершения.
+    Используется для push-уведомления о новой функции без повторного запуска
+    всей цепочки (агент 2, риск 5 / решение пользователя).
+    """
+    if not learning_is_complete(tg_id, role):
+        return []
+    return learning_pending_scenarios(tg_id, role)
+
+def delete_training_tasks(tg_id):
+    """Удаляет все тренажёрные задачи сотрудника из листа tasks (по завершению
+    обучения, или после 5 рабочих дней брошенного на середине прогресса)."""
+    ws = tasks_sheet()
+    records = safe_records(ws, TH)
+    to_delete = [
+        i + 2 for i, r in enumerate(records)
+        if str(r["assigned_to_id"]) == str(tg_id)
+        and str(r.get("is_training", "")).upper() == "TRUE"
+    ]
+    for row_i in sorted(to_delete, reverse=True):
+        ws.delete_rows(row_i)
+    if to_delete:
+        invalidate_cache("tasks")
+    return len(to_delete)
+
+def count_working_days_between(start_str: str, end_date) -> int:
+    """Считает рабочие дни (пн-пт) между датой start_str (YYYY-MM-DD HH:MM или
+    YYYY-MM-DD) и end_date (объект date), не включая выходные."""
+    if not start_str:
+        return 0
+    try:
+        start_date = datetime.strptime(start_str[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return 0
+    if start_date >= end_date:
+        return 0
+    count = 0
+    d = start_date
+    while d < end_date:
+        d += timedelta(days=1)
+        if d.weekday() < 5:
+            count += 1
+    return count
+
+def learning_abandoned_employees() -> list:
+    """
+    Сотрудники, которые начали обучение, не завершили его, и прогресс
+    'застрял' (started_at есть, completed_at пусто). Возвращает список
+    словарей строк прогресса — используется для ежедневного напоминания
+    в 14:00 МСК и для автоудаления после 5 рабочих дней.
+    Исключает founder — если человека повысили до учредителя посреди
+    незавершённого обучения, напоминания ему больше не нужны (роль не
+    проходит обучение вообще).
+    """
+    result = []
+    for r in learning_all():
+        if not (r.get("started_at") and not r.get("completed_at")):
+            continue
+        u = emp_by_id(int(r["tg_id"])) if r.get("tg_id") else None
+        if u and u["role"] == "founder":
+            continue
+        result.append(r)
+    return result
 
 def tasks_sheet():
     ws = sheet("tasks"); ensure_headers(ws, TH); return ws
 
 def tasks_all():
     return safe_records(tasks_sheet(), TH)
+
+def tasks_all_real():
+    """
+    Все задачи КРОМЕ тренажёрных (is_training=TRUE). Это единственное место,
+    где должен происходить такой фильтр — все агрегатные функции (дайджесты,
+    /menu, экспорт, /team, аудиты) обязаны использовать именно эту функцию,
+    а не tasks_all() напрямую, иначе тренажёрные задачи попадут в реальную
+    отчётность и испортят цифры (агент 2, риск 1).
+    """
+    return [t for t in tasks_all() if str(t.get("is_training", "")).upper() != "TRUE"]
+
+def tasks_all_training(tg_id=None):
+    """Только тренажёрные задачи, опционально отфильтрованные по сотруднику —
+    используется для автоудаления и напоминаний о брошенном обучении."""
+    result = [t for t in tasks_all() if str(t.get("is_training", "")).upper() == "TRUE"]
+    if tg_id is not None:
+        result = [t for t in result if str(t["assigned_to_id"]) == str(tg_id)]
+    return result
 
 def task_by_id(tid):
     for r in tasks_all():
@@ -657,23 +793,25 @@ def task_by_id(tid):
     return None
 
 def tasks_for_user(tg_id):
+    """Не фильтрует тренажёрные задачи — используется в /mytasks, где сотрудник
+    должен видеть свои тестовые задачи во время прохождения обучения."""
     return [r for r in tasks_all()
             if str(r["assigned_to_id"]) == str(tg_id) and r["status"] not in ("done",)]
 
 def tasks_open():
-    return [r for r in tasks_all() if r["status"] in ("open","in_progress","paused")]
+    return [r for r in tasks_all_real() if r["status"] in ("open","in_progress","paused")]
 
 def tasks_overdue():
     today = today_str()
-    return [r for r in tasks_all()
+    return [r for r in tasks_all_real()
             if r["status"] not in ("done",) and r.get("deadline","") and r["deadline"] < today]
 
 def tasks_due_tomorrow():
     tmr = (date.today() + timedelta(days=1)).strftime("%Y-%m-%d")
-    return [r for r in tasks_all() if r.get("deadline") == tmr and r["status"] != "done"]
+    return [r for r in tasks_all_real() if r.get("deadline") == tmr and r["status"] != "done"]
 
 def tasks_due_today_list():
-    return [r for r in tasks_all()
+    return [r for r in tasks_all_real()
             if r.get("deadline") == today_str() and r["status"] != "done"]
 
 def task_find_row(tid):
@@ -682,12 +820,12 @@ def task_find_row(tid):
             return i
     return None
 
-def task_create(by_id, by_name, to_id, to_name, title, deadline, source="manual", channel=""):
+def task_create(by_id, by_name, to_id, to_name, title, deadline, source="manual", channel="", is_training=False):
     tid = str(uuid.uuid4())[:8].upper()
     tasks_sheet().append_row([
         tid, by_id, by_name, to_id, to_name, title,
         deadline, "open", datetime.now().strftime("%Y-%m-%d %H:%M"),
-        "", "", "", source, channel
+        "", "", "", source, channel, "TRUE" if is_training else ""
     ])
     invalidate_cache("tasks")
     return tid
@@ -838,6 +976,16 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     tg_id = update.effective_user.id
     if emp_registered(tg_id):
         u = emp_by_id(tg_id)
+
+        if u["role"] == "founder":
+            await update.effective_message.reply_text(
+                f"👋 Привет, {u['full_name']}! Ты учредитель.\n\n"
+                "Ты видишь результаты работы и задачи всей компании в режиме "
+                "просмотра — планы, отчёты и закрытие дня тебя не касаются.\n\n"
+                "/menu — открыть панель просмотра"
+            )
+            return ConversationHandler.END
+
         role_labels = {"admin": "руководитель", "dept_head": "руководитель отдела", "employee": "сотрудник"}
         role = role_labels.get(u["role"], "сотрудник")
         dept = get_dept(tg_id)
@@ -968,27 +1116,30 @@ async def recv_plan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = emp_by_id(tg_id)
     text = update.message.text.strip()
     today = today_str()
+    is_training = _learning_in_progress.get(tg_id) == "plan"
 
-    save_plan(tg_id, u["full_name"], text)
+    if not is_training:
+        save_plan(tg_id, u["full_name"], text)
 
-    # удаляем старые задачи из плана на сегодня
-    ws = tasks_sheet()
-    all_rows = safe_records(ws, TH)
-    to_delete = [i+2 for i, r in enumerate(all_rows)
-                 if str(r["assigned_to_id"]) == str(tg_id)
-                 and r.get("created_at","").startswith(today)
-                 and r.get("source","") == "plan"]
-    for row_i in sorted(to_delete, reverse=True):
-        ws.delete_rows(row_i)
-    if to_delete:
-        invalidate_cache("tasks")
+        # удаляем старые задачи из плана на сегодня (только реальные, не тренажёрные)
+        ws = tasks_sheet()
+        all_rows = safe_records(ws, TH)
+        to_delete = [i+2 for i, r in enumerate(all_rows)
+                     if str(r["assigned_to_id"]) == str(tg_id)
+                     and r.get("created_at","").startswith(today)
+                     and r.get("source","") == "plan"
+                     and str(r.get("is_training","")).upper() != "TRUE"]
+        for row_i in sorted(to_delete, reverse=True):
+            ws.delete_rows(row_i)
+        if to_delete:
+            invalidate_cache("tasks")
 
-    # создаём задачи из плана
+    # создаём задачи из плана (тренажёрные, если запущено из обучения)
     items = parse_plan_items(text)
     created_ids = []
     for item, item_deadline in items:
         tid = task_create(tg_id, u["full_name"], tg_id, u["full_name"],
-                          item, item_deadline, source="plan")
+                          item, item_deadline, source="plan", is_training=is_training)
         created_ids.append((tid, item, item_deadline))
 
     if created_ids:
@@ -1000,8 +1151,9 @@ async def recv_plan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         keyboard = InlineKeyboardMarkup([[
             InlineKeyboardButton("✅ Подтвердить задачи", callback_data=f"confirm_plan_{tg_id}"),
         ]])
+        training_note = "\n\n<i>🎓 Это тренажёр — задачи учебные, реальный план не записан.</i>" if is_training else ""
         await update.message.reply_text(
-            f"📋 План записан! Создано <b>{len(created_ids)} задач</b>:\n\n{task_list}\n\n"
+            f"📋 План записан! Создано <b>{len(created_ids)} задач</b>:\n\n{task_list}{training_note}\n\n"
             f"Совет: укажи [ДД.ММ.ГГГГ] в конце строки, если срок не сегодня.\n"
             f"Нажми кнопку чтобы подтвердить — или добавь задачи вручную через /task",
             parse_mode="HTML", reply_markup=keyboard
@@ -1034,8 +1186,9 @@ _eod_state = {}
 
 # Отмечает, что пользователь запустил действие (план/задачу/тег и т.д.) из
 # карточки обучения, через кнопку "Попробовать сейчас". Используется чтобы
-# после завершения действия сразу предложить кнопку "Продолжить обучение",
-# вместо того чтобы человек искал глазами старое сообщение с карточками выше.
+# после РЕАЛЬНОГО завершения действия засчитать шаг пройденным и сразу
+# предложить кнопку "Продолжить обучение", вместо того чтобы человек искал
+# глазами старое сообщение с карточками выше.
 _learning_in_progress = {}  # tg_id -> scenario_id
 
 def mark_learning_action(tg_id, scenario_id):
@@ -1043,14 +1196,34 @@ def mark_learning_action(tg_id, scenario_id):
 
 def pop_learning_continue_keyboard(tg_id):
     """
-    Если действие было запущено из обучения — возвращает клавиатуру с кнопкой
-    'Продолжить обучение' и убирает отметку (одноразовая подсказка на одно
-    завершённое действие). Если действие не из обучения — возвращает None,
-    обычный поток не получает лишних кнопок.
+    Если действие было запущено из обучения — засчитывает шаг пройденным
+    (только теперь, по факту завершения действия, не по факту просмотра
+    карточки) и возвращает клавиатуру с кнопкой 'Продолжить обучение'.
+    Если это был последний шаг последовательности — автоматически удаляет
+    все тренажёрные задачи сотрудника и фиксирует completed_at, чтобы
+    больше не считать обучение 'брошенным на середине'.
+    Если действие не из обучения — возвращает None, обычный поток не
+    получает лишних кнопок и прогресс не засчитывается.
     """
     scenario_id = _learning_in_progress.pop(tg_id, None)
     if not scenario_id:
         return None
+    scenario = next((s for s in LEARN_SCENARIOS if s["id"] == scenario_id), None)
+    if not scenario:
+        return None
+    u = emp_by_id(tg_id)
+    if not u:
+        return None
+    learning_mark_done(tg_id, u["full_name"], scenario["id"], scenario["version"])
+
+    role = u["role"]
+    if learning_is_complete(tg_id, role):
+        delete_training_tasks(tg_id)
+        learning_set_field(tg_id, "completed_at", datetime.now().strftime("%Y-%m-%d %H:%M"))
+        return InlineKeyboardMarkup([[
+            InlineKeyboardButton("🎉 Посмотреть итог", callback_data="learn_main"),
+        ]])
+
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("📚 Продолжить обучение", callback_data="learn_main"),
     ]])
@@ -1399,8 +1572,10 @@ async def recv_tasknew_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     creator = emp_by_id(tg_id)
     assignee = emp_by_id(int(assignee_tg_id))
+    is_training = _learning_in_progress.get(tg_id) == "task"
     tid = task_create(tg_id, creator["full_name"],
-                      int(assignee_tg_id), assignee["full_name"], title, deadline)
+                      int(assignee_tg_id), assignee["full_name"], title, deadline,
+                      is_training=is_training)
     dl_fmt = fmt_dl(deadline)
     try:
         await ctx.bot.send_message(
@@ -1412,9 +1587,10 @@ async def recv_tasknew_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
     except Exception: pass
     learn_kb = pop_learning_continue_keyboard(tg_id)
+    training_note = "\n\n<i>🎓 Это тренажёр — уведомление исполнителю не имеет реальных последствий.</i>" if is_training else ""
     await update.message.reply_text(
         f"✅ Задача создана!\n<b>{title}</b>\nИсполнитель: {assignee['full_name']}\n"
-        f"Срок: {dl_fmt}\nID: <code>{tid}</code>", parse_mode="HTML",
+        f"Срок: {dl_fmt}\nID: <code>{tid}</code>{training_note}", parse_mode="HTML",
         reply_markup=learn_kb
     )
 
@@ -1879,9 +2055,42 @@ def build_admin_keyboard():
     ]
     return InlineKeyboardMarkup(rows)
 
+def build_founder_keyboard():
+    """
+    Read-only панель для учредителя: видит результаты и задачи всей компании,
+    как admin, но без единой управляющей кнопки — не напоминает, не
+    восстанавливает задачи, не рассылает обучение, не запрашивает статусы.
+    Только просмотр.
+    """
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📋 Задачи сегодня",   callback_data="tasks_today"),
+            InlineKeyboardButton("📋 Все активные",     callback_data="show_all_tasks"),
+        ],
+        [
+            InlineKeyboardButton("⚠️ Просроченные",     callback_data="overdue_pick"),
+            InlineKeyboardButton("✅ Закрытые задачи",  callback_data="closed_period_pick"),
+        ],
+        [
+            InlineKeyboardButton("📊 По отделам",       callback_data="summary_depts"),
+            InlineKeyboardButton("👤 По сотруднику",    callback_data="summary_person_list"),
+        ],
+        [
+            InlineKeyboardButton("📅 За неделю",        callback_data="period_week"),
+            InlineKeyboardButton("📅 За месяц",         callback_data="period_month"),
+        ],
+        [
+            InlineKeyboardButton("📥 Экспорт",          callback_data="export_dept_pick"),
+            InlineKeyboardButton("📈 Динамика",         callback_data="dynamics_dept"),
+        ],
+    ])
+
 def menu_keyboard_for(tg_id: int):
-    """Возвращает правильную клавиатуру по роли: dept_head видит базовую,
-    admin видит полную с административным блоком."""
+    """Возвращает правильную клавиатуру по роли: founder видит read-only панель
+    по всей компании, dept_head видит базовую по своему отделу, admin видит
+    полную с административным блоком."""
+    if emp_is_founder(tg_id):
+        return build_founder_keyboard()
     return build_admin_keyboard() if emp_is_admin(tg_id) else build_dept_head_keyboard()
 
 def fmt_dl(deadline: str) -> str:
@@ -1943,17 +2152,25 @@ def is_admin_check(query) -> bool:
     return emp_has_management_access(query.from_user.id)
 
 def is_strict_admin_check(query) -> bool:
-    """Только admin — для чисто административных функций (экспорт, динамика,
-    восстановление задач), которых dept_head не должен видеть вообще, даже
-    если узнает callback_data каким-то иным путём."""
+    """Только admin — для управляющих действий (рассылка обучения,
+    восстановление задач), которых ни dept_head, ни founder не должны
+    видеть вообще, даже если узнают callback_data каким-то иным путём."""
     return emp_is_admin(query.from_user.id)
+
+def is_readonly_admin_check(query) -> bool:
+    """admin или founder — для read-only функций уровня компании (экспорт,
+    динамика), которые не управляют ничем, только показывают данные.
+    founder должен видеть их (видит всё как admin), dept_head — нет
+    (видит только свой отдел через обычный is_admin_check)."""
+    tg_id = query.from_user.id
+    return emp_is_admin(tg_id) or emp_is_founder(tg_id)
 
 def dept_filter_for(query) -> str:
     """Пустая строка для admin (видит всё), иначе название отдела."""
     return emp_managed_dept(query.from_user.id)
 
 def tasks_for_date(target_date: str) -> list:
-    return [t for t in tasks_all() if t.get("deadline","") == target_date and t["status"] != "done"]
+    return [t for t in tasks_all_real() if t.get("deadline","") == target_date and t["status"] != "done"]
 
 # ── ADMIN COMMANDS ────────────────────────────────────────────────────────────
 async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2110,6 +2327,60 @@ async def cb_sethead_emp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"Теперь доступна команда /menu — сводки и задачи по твоему отделу."
         )
     except Exception: pass
+
+async def cmd_setfounder(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    /setfounder @username — назначить учредителем. Человек должен сначала
+    сам написать /start и зарегистрироваться (выбрать любой отдел — это
+    значения не имеет, роль founder его перекроет), затем admin назначает
+    эту команду. После назначения у учредителя спрашивается, хочет ли он
+    самостоятельно заходить в /menu, или получать автоматическую ежедневную
+    сводку, или и то и другое.
+    """
+    if not emp_is_admin(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ Только для администраторов."); return
+    if not ctx.args:
+        await update.effective_message.reply_text("Укажи: /setfounder @username"); return
+    username = ctx.args[0].lstrip("@")
+    for e in emp_all():
+        if e["username"].lstrip("@").lower() == username.lower():
+            emp_set_role(int(e["tg_id"]), "founder")
+            await update.effective_message.reply_text(
+                f"✅ {e['full_name']} теперь учредитель.\n"
+                f"Видит результаты и задачи всей компании в режиме просмотра."
+            )
+            try:
+                keyboard = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📊 Заходить самостоятельно", callback_data="founder_pref_manual")],
+                    [InlineKeyboardButton("📬 Получать ежедневную сводку", callback_data="founder_pref_digest")],
+                    [InlineKeyboardButton("📊📬 И то, и другое", callback_data="founder_pref_both")],
+                ])
+                await ctx.bot.send_message(
+                    int(e["tg_id"]),
+                    "👋 Тебя назначили учредителем!\n\n"
+                    "Ты видишь результаты работы и задачи всей компании в "
+                    "режиме просмотра — без необходимости писать планы, отчёты "
+                    "или закрывать день.\n\n"
+                    "Как тебе удобнее получать информацию?",
+                    reply_markup=keyboard
+                )
+            except Exception as ex:
+                logger.warning(f"setfounder notify {e['tg_id']}: {ex}")
+            return
+    await update.effective_message.reply_text(f"❌ @{username} не найден.")
+
+async def cb_founder_pref(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Учредитель выбрал предпочтение по уведомлениям."""
+    query = update.callback_query; await query.answer("Записано")
+    pref = query.data.replace("founder_pref_", "", 1)  # manual|digest|both
+    tg_id = query.from_user.id
+    emp_set_founder_digest_pref(tg_id, pref)
+    labels = {
+        "manual": "Будешь заходить в /menu самостоятельно, когда захочешь.",
+        "digest": "Будешь получать ежедневную сводку автоматически в 19:35.",
+        "both": "Будешь и получать ежедневную сводку, и можешь заходить в /menu в любой момент.",
+    }
+    await query.edit_message_text(f"✅ Готово!\n{labels.get(pref, '')}")
 
 async def cmd_setdept(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """
@@ -2278,7 +2549,7 @@ def recover_tasks_from_plans(date_from: str, date_to: str, dept_filter: str = ""
     if dept_filter:
         all_plans = [p for p in all_plans if get_dept(p["tg_id"]) == dept_filter]
 
-    all_t = tasks_all()
+    all_t = tasks_all_real()
     # ключ существующей задачи из плана: (tg_id, date, title) — чтобы не дублировать
     existing_keys = set()
     for t in all_t:
@@ -2391,45 +2662,68 @@ async def cb_checkstatuses_now(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ── ADMIN CALLBACKS ───────────────────────────────────────────────────────────
 async def cb_learn_main(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Главное меню обучения — список сценариев кнопками, отфильтрован по роли.
-    Каждая кнопка помечена: ✅ пройдено в актуальной версии, 🆕 новое/непройденное."""
+    """
+    Главное меню обучения — строгая последовательность по роли. Показывает
+    прогресс-бар (✅ пройдено, ▶️ текущий доступный шаг, 🔒 заблокировано
+    до прохождения предыдущих). Кликабельна только кнопка текущего шага.
+    Если всё пройдено — показывает итог и предлагает новые сценарии, если
+    появились после завершения (без повтора всей цепочки).
+    """
     query = update.callback_query; await query.answer()
     tg_id = query.from_user.id
     u = emp_by_id(tg_id)
     if not u:
         await query.message.reply_text("Сначала /start"); return
-    scenarios = learn_scenarios_for_role(u["role"])
-    completed = learning_completed_versions(tg_id)
-    buttons = []
-    row = []
-    for s in scenarios:
-        mark = "✅" if completed.get(s["id"], 0) >= s["version"] else "🆕"
-        row.append(InlineKeyboardButton(f"{mark} {s['label']}", callback_data=f"learn_{s['id']}"))
-        if len(row) == 2:
-            buttons.append(row); row = []
-    if row: buttons.append(row)
-    await query.message.reply_text(
-        "📚 Чему хочешь научиться?\n(🆕 — новое или обновлённое, ✅ — уже изучено)",
-        reply_markup=InlineKeyboardMarkup(buttons)
-    )
+
+    role = u["role"]
+    sequence = learn_scenarios_for_role(role)
+    current_idx = learning_current_step_index(tg_id, role)
+
+    if current_idx >= len(sequence):
+        # обучение полностью пройдено — проверяем, нет ли новых сценариев
+        new_ones = learning_new_scenarios_since_completion(tg_id, role)
+        lines = [f"🎉 <b>Обучение завершено!</b> Пройдено {len(sequence)}/{len(sequence)} шагов."]
+        if new_ones:
+            lines.append("\nПоявились новые функции бота:")
+            buttons = [[InlineKeyboardButton(s["label"], callback_data=f"learn_{s['id']}")] for s in new_ones]
+            await query.message.reply_text("\n".join(lines), parse_mode="HTML",
+                                            reply_markup=InlineKeyboardMarkup(buttons))
+        else:
+            await query.message.reply_text("\n".join(lines), parse_mode="HTML")
+        return
+
+    lines = ["📚 <b>Твой прогресс обучения:</b>\n"]
+    for i, s in enumerate(sequence):
+        if i < current_idx:
+            lines.append(f"✅ {s['label']}")
+        elif i == current_idx:
+            lines.append(f"▶️ {s['label']} — текущий шаг")
+        else:
+            lines.append(f"🔒 {s['label']}")
+
+    current = sequence[current_idx]
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton(f"▶️ Начать: {current['label']}", callback_data=f"learn_{current['id']}"),
+    ]])
+    await query.message.reply_text("\n".join(lines), parse_mode="HTML", reply_markup=keyboard)
 
 async def cb_learn_scenario(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Открывает карточку конкретного сценария с кнопкой 'Попробовать сейчас'.
-    Просмотр карточки фиксируется в листе learning_progress как факт ознакомления."""
+    """
+    Открывает карточку текущего доступного шага с кнопкой 'Попробовать сейчас'.
+    ВАЖНО: просмотр карточки сам по себе НЕ засчитывается как прохождение —
+    шаг отмечается пройденным только когда практическое действие реально
+    завершено (см. pop_learning_continue_keyboard и места его вызова).
+    Кнопки 'назад' нет — порядок строгий, нельзя перепрыгнуть или вернуться
+    к выбору другого шага.
+    """
     query = update.callback_query; await query.answer()
     scenario_id = query.data.replace("learn_", "", 1)
     scenario = next((s for s in LEARN_SCENARIOS if s["id"] == scenario_id), None)
     if not scenario:
         await query.message.reply_text("Сценарий не найден."); return
 
-    tg_id = query.from_user.id
-    u = emp_by_id(tg_id)
-    if u:
-        learning_mark_done(tg_id, u["full_name"], scenario["id"], scenario["version"])
-
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton(f"▶️ Попробовать {scenario['try_cmd']}", callback_data=f"learntry_{scenario['id']}")],
-        [InlineKeyboardButton("◀️ Назад к обучению", callback_data="learn_main")],
     ])
     await query.message.reply_text(scenario["text"], parse_mode="HTML", reply_markup=keyboard)
 
@@ -2801,7 +3095,7 @@ async def cb_summary_depts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         employees = [e for e in employees if get_dept(e["tg_id"]) == dept_filter]
     plan_ids   = {str(p["tg_id"]) for p in plans_today()}
     report_ids = {str(r["tg_id"]) for r in reports_today()}
-    all_t = tasks_all()
+    all_t = tasks_all_real()
     today = today_str(); today_fmt = date.today().strftime("%d.%m.%Y")
     dept_employees: dict = {}
     for e in employees:
@@ -2859,7 +3153,7 @@ async def cb_summary_person(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     today = today_str(); today_fmt = date.today().strftime("%d.%m.%Y")
     plan_ids   = {str(p["tg_id"]) for p in plans_today()}
     report_ids = {str(r["tg_id"]) for r in reports_today()}
-    all_t = tasks_all()
+    all_t = tasks_all_real()
     emp_tasks = [t for t in all_t if str(t["assigned_to_id"]) == tg_id and t["status"] != "done"]
     done_today = [t for t in all_t if str(t["assigned_to_id"]) == tg_id
                   and t["status"] == "done" and t.get("done_at","").startswith(today)]
@@ -2900,7 +3194,7 @@ async def cb_period_week(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if dept_filter:
         employees = [e for e in employees if get_dept(e["tg_id"]) == dept_filter]
     reps       = reports_for_period(week_start, week_end)
-    all_t      = tasks_all()
+    all_t      = tasks_all_real()
     done_w     = [t for t in all_t if t["status"] == "done"
                   and t.get("done_at","")[:10] >= week_start]
     over       = tasks_overdue()
@@ -2943,7 +3237,7 @@ async def cb_period_month(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if dept_filter:
         employees = [e for e in employees if get_dept(e["tg_id"]) == dept_filter]
     reps      = reports_for_period(month_start, month_end)
-    all_t     = tasks_all()
+    all_t     = tasks_all_real()
     done_m    = [t for t in all_t if t["status"] == "done"
                  and t.get("done_at","")[:10] >= month_start]
     over      = tasks_overdue()
@@ -3001,7 +3295,7 @@ async def cb_closed_tasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         start = today.replace(day=1).strftime("%Y-%m-%d")
         label = f"за {today.strftime('%B %Y')}"
 
-    all_t = tasks_all()
+    all_t = tasks_all_real()
     done = [t for t in all_t if t["status"] == "done" and t.get("done_at","")[:10] >= start]
     if dept_filter:
         done = [t for t in done if get_dept(t["assigned_to_id"]) == dept_filter]
@@ -3032,7 +3326,7 @@ async def cb_closed_tasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cb_export_dept_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Выбор периода для экспорта в Excel."""
     query = update.callback_query; await query.answer()
-    if not is_strict_admin_check(query): return
+    if not is_readonly_admin_check(query): return
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("Неделя", callback_data="export_week")],
         [InlineKeyboardButton("Месяц",  callback_data="export_month")],
@@ -3050,7 +3344,7 @@ def build_export_workbook(dept_filter: str, period: str):
         start = today.replace(day=1).strftime("%Y-%m-%d")
         label = today.strftime("%B %Y")
 
-    all_t = tasks_all()
+    all_t = tasks_all_real()
     rows = [t for t in all_t if t.get("created_at","")[:10] >= start
             or t.get("done_at","")[:10] >= start]
     if dept_filter:
@@ -3089,7 +3383,7 @@ def build_export_workbook(dept_filter: str, period: str):
 async def cb_export_period(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Формирует и отправляет xlsx-файл."""
     query = update.callback_query; await query.answer()
-    if not is_strict_admin_check(query): return
+    if not is_readonly_admin_check(query): return
     dept_filter = dept_filter_for(query)
     period = query.data.replace("export_", "", 1)  # week|month
 
@@ -3105,9 +3399,9 @@ async def cb_export_period(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cb_dynamics_dept(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Динамика выполнения задач по неделям — текстовый спарклайн за последние 4 недели."""
     query = update.callback_query; await query.answer()
-    if not is_strict_admin_check(query): return
+    if not is_readonly_admin_check(query): return
     dept_filter = dept_filter_for(query)
-    all_t = tasks_all()
+    all_t = tasks_all_real()
     if dept_filter:
         all_t = [t for t in all_t if get_dept(t["assigned_to_id"]) == dept_filter]
 
@@ -3167,6 +3461,55 @@ async def job_request_eod(bot: Bot):
         await start_eod_flow(bot, int(e["tg_id"]))
     logger.info("job_request_eod: done")
 
+async def job_learning_reminder(bot: Bot):
+    """
+    14:00 МСК каждый день — напоминает сотрудникам, которые начали обучение,
+    но не завершили его (started_at есть, completed_at пусто). После 5 рабочих
+    дней с начала — сбрасывает прогресс и удаляет тренажёрные задачи, чтобы
+    не копился незавершённый мусор в листах tasks и learning_progress.
+    """
+    today = date.today()
+    for r in learning_abandoned_employees():
+        tg_id = int(r["tg_id"])
+        working_days = count_working_days_between(r.get("started_at", ""), today)
+
+        if working_days >= 5:
+            delete_training_tasks(tg_id)
+            # сбрасываем прогресс: очищаем все колонки сценариев и started_at,
+            # чтобы при следующем обращении обучение началось заново с шага 1
+            ws = learning_sheet()
+            columns = learning_columns()
+            records = safe_records(ws, columns)
+            for i, rec in enumerate(records, start=2):
+                if str(rec["tg_id"]) == str(tg_id):
+                    blank = [tg_id, rec["full_name"], rec["role"], rec["department"], "", "", ""]
+                    blank += [""] * len(LEARN_SCENARIOS)
+                    ws.update(f"A{i}", [blank])
+                    invalidate_cache("learning_progress")
+                    break
+            try:
+                await bot.send_message(
+                    tg_id,
+                    "⏳ Обучение не было завершено в течение 5 рабочих дней.\n"
+                    "Прогресс сброшен, тренажёрные задачи удалены.\n\n"
+                    "Напиши /start, чтобы начать заново."
+                )
+            except Exception as ex:
+                logger.warning(f"learning_reminder reset {tg_id}: {ex}")
+            continue
+
+        try:
+            await bot.send_message(
+                tg_id,
+                "📚 Напоминание: ты начал(а) обучение, но не закончил(а).\n"
+                f"Если не завершить за {5 - working_days} рабочих дней — "
+                "прогресс и тестовые задачи будут сброшены.\n\n"
+                "Напиши /start или нажми «📚 Обучение» в /menu, чтобы продолжить."
+            )
+            learning_set_field(tg_id, "last_reminder_at", datetime.now().strftime("%Y-%m-%d %H:%M"))
+        except Exception as ex:
+            logger.warning(f"learning_reminder {tg_id}: {ex}")
+
 async def job_ping_deadlines(bot: Bot):
     for t in tasks_due_tomorrow():
         try:
@@ -3210,7 +3553,7 @@ async def job_daily_digest(bot: Bot):
     p_list = plans_today(); r_list = reports_today()
     plan_ids   = {str(p["tg_id"]) for p in p_list}
     report_ids = {str(r["tg_id"]) for r in r_list}
-    all_t = tasks_all()
+    all_t = tasks_all_real()
     over = tasks_overdue()
     done_today = [t for t in all_t if t["status"] == "done"
                   and t.get("done_at","").startswith(datetime.now().strftime("%Y-%m-%d"))]
@@ -3269,6 +3612,16 @@ async def job_daily_digest(bot: Bot):
         except Exception as ex:
             logger.warning(f"daily_digest dept_head {head['tg_id']}: {ex}")
 
+    # ── Ежедневная сводка учредителям, выбравшим digest/both ──
+    founders = [r for r in emp_all() if r["role"] == "founder"
+                and r.get("founder_digest_pref") in ("digest", "both")]
+    for f in founders:
+        try:
+            await send_long_text(bot, int(f["tg_id"]), lines,
+                                 parse_mode="HTML", reply_markup=build_founder_keyboard())
+        except Exception as ex:
+            logger.warning(f"daily_digest founder {f['tg_id']}: {ex}")
+
 async def job_weekly_audit(bot: Bot):
     now = datetime.now()
     ws = now.strftime("%Y-W%W")
@@ -3277,7 +3630,7 @@ async def job_weekly_audit(bot: Bot):
     employees = emp_employees()
     plans_w   = records_for_week("plans", PH)
     reports_w = records_for_week("reports", RH)
-    all_t     = tasks_all()
+    all_t     = tasks_all_real()
     done_w    = [t for t in all_t if t["status"]=="done" and _is_this_week(t.get("done_at",""), ws)]
     over      = tasks_overdue()
     lines = [f"📅 <b>Еженедельный аудит ({w0} — {w1})</b>\n",
@@ -3303,7 +3656,7 @@ async def job_monthly_audit(bot: Bot):
     wd = sum(1 for d in range(1, now.day+1) if datetime(now.year, now.month, d).weekday() < 5)
     employees = emp_employees()
     reps      = records_for_month("reports", RH)
-    all_t     = tasks_all()
+    all_t     = tasks_all_real()
     done_m    = [t for t in all_t if t["status"]=="done" and t.get("done_at","").startswith(month)]
     over      = tasks_overdue()
     lines = [f"📆 <b>Ежемесячный аудит — {month_label}</b>\n",
@@ -3337,6 +3690,7 @@ def build_scheduler(bot: Bot):
     j(job_request_plans,   day_of_week="mon-fri", hour=11, minute=0)
     j(job_remind_plans,    day_of_week="mon-fri", hour=11, minute=30)
     j(job_ping_deadlines,  day_of_week="mon-fri", hour=10, minute=0)
+    j(job_learning_reminder, day_of_week="mon-fri", hour=14, minute=0)
     j(job_request_eod,     day_of_week="mon-fri", hour=19, minute=0)
     j(job_daily_digest,    day_of_week="mon-fri", hour=19, minute=35)
     j(job_weekly_audit,    day_of_week="fri",     hour=18, minute=0)
@@ -3369,6 +3723,7 @@ async def post_init(app):
         ("recovertasks", "Восстановить пропавшие задачи из планов: /recovertasks [дней]"),
         ("makeadmin", "Стать администратором"),
         ("setdepthead", "Назначить руководителя отдела: /setdepthead @username"),
+        ("setfounder", "Назначить учредителя: /setfounder @username"),
         ("setdept", "Сменить отдел сотрудника: /setdept @username"),
         ("fixname", "Исправить имя: /fixname @username Имя Фамилия"),
         ("fixallnames", "Нормализовать имена всех сотрудников"),
@@ -3429,6 +3784,7 @@ def main():
     app.add_handler(CommandHandler("makeadmin", cmd_makeadmin))
     app.add_handler(CommandHandler("setadmin",  cmd_setadmin))
     app.add_handler(CommandHandler("setdepthead", cmd_setdepthead))
+    app.add_handler(CommandHandler("setfounder", cmd_setfounder))
     app.add_handler(CommandHandler("setdept", cmd_setdept))
     app.add_handler(CommandHandler("fixsheets", cmd_fixsheets))
     app.add_handler(CommandHandler("fixname", cmd_fixname))
@@ -3456,6 +3812,7 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_tagchannel_pick,     pattern="^tagchannel_"))
     app.add_handler(CallbackQueryHandler(cb_sethead_dept,        pattern="^sethead_dept_"))
     app.add_handler(CallbackQueryHandler(cb_sethead_emp,         pattern="^sethead_emp_"))
+    app.add_handler(CallbackQueryHandler(cb_founder_pref,        pattern="^founder_pref_"))
     app.add_handler(CallbackQueryHandler(cb_reg_dept,            pattern="^reg_dept_"))
     app.add_handler(CallbackQueryHandler(cb_admset_head,         pattern="^admset_head_"))
     app.add_handler(CallbackQueryHandler(cb_admset_dept,         pattern="^admset_dept_"))
