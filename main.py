@@ -211,7 +211,7 @@ def safe_records(ws, headers):
     raise last_error
 
 # ── EMPLOYEES ─────────────────────────────────────────────────────────────────
-EMP_H = ["tg_id","username","full_name","role","registered_at","department","founder_digest_pref"]
+EMP_H = ["tg_id","username","full_name","role","registered_at","department","founder_digest_pref","shift_schedule"]
 
 def emp_sheet():
     ws = sheet("employees"); ensure_headers(ws, EMP_H); return ws
@@ -274,7 +274,7 @@ def emp_register(tg_id, username, full_name, role="employee", department=""):
     if emp_registered(tg_id):
         return False
     emp_sheet().append_row([tg_id, username or "", full_name, role,
-                             datetime.now().strftime("%Y-%m-%d %H:%M"), department, ""])
+                             datetime.now().strftime("%Y-%m-%d %H:%M"), department, "", ""])
     invalidate_cache("employees")
     return True
 
@@ -303,6 +303,31 @@ def emp_set_founder_digest_pref(tg_id, pref: str):
     for i, r in enumerate(safe_records(ws, EMP_H), start=2):
         if str(r["tg_id"]) == str(tg_id):
             ws.update_cell(i, EMP_H.index("founder_digest_pref") + 1, pref)
+            invalidate_cache("employees")
+            return True
+    return False
+
+# Графики работы: "" (пусто) или "standard" = 10:00–19:00, "shifted" = 11:00–22:00.
+# Назначается вручную admin через /setshift — для должностей с другим графиком
+# (например продавцы в магазине/шоуруме).
+SHIFT_SCHEDULES = {
+    "standard": {"start_hour": 10, "start_minute": 0, "end_hour": 19, "end_minute": 0},
+    "shifted":  {"start_hour": 11, "start_minute": 0, "end_hour": 22, "end_minute": 0},
+}
+
+def emp_shift(tg_id) -> dict:
+    """Возвращает словарь {start_hour, start_minute, end_hour, end_minute}
+    для сотрудника — standard по умолчанию, shifted если назначено явно."""
+    r = emp_by_id(tg_id)
+    code = (r.get("shift_schedule") if r else "") or "standard"
+    return SHIFT_SCHEDULES.get(code, SHIFT_SCHEDULES["standard"])
+
+def emp_set_shift_schedule(tg_id, code: str):
+    """code: 'standard' или 'shifted'."""
+    ws = emp_sheet()
+    for i, r in enumerate(safe_records(ws, EMP_H), start=2):
+        if str(r["tg_id"]) == str(tg_id):
+            ws.update_cell(i, EMP_H.index("shift_schedule") + 1, code)
             invalidate_cache("employees")
             return True
     return False
@@ -359,6 +384,54 @@ def has_plan_today(tg_id):
 def has_report_today(tg_id):
     return any(str(r["tg_id"]) == str(tg_id) for r in reports_today())
 
+# ── РАБОЧИЙ ДЕНЬ: СТАРТ/КОНЕЦ ────────────────────────────────────────────────
+WH = ["date", "tg_id", "full_name", "start_at", "end_at"]
+
+def workday_sheet():
+    ws = sheet("workday"); ensure_headers(ws, WH); return ws
+
+def workday_today() -> list:
+    return [r for r in safe_records(workday_sheet(), WH) if r["date"] == today_str()]
+
+def workday_row_for(tg_id):
+    for r in workday_today():
+        if str(r["tg_id"]) == str(tg_id):
+            return r
+    return None
+
+def workday_started(tg_id) -> bool:
+    r = workday_row_for(tg_id)
+    return bool(r and r.get("start_at"))
+
+def workday_ended(tg_id) -> bool:
+    r = workday_row_for(tg_id)
+    return bool(r and r.get("end_at"))
+
+def workday_mark_start(tg_id, full_name):
+    """Отмечает начало рабочего дня. Если строка на сегодня уже есть — не
+    дублирует и не перезаписывает существующий start_at (защита от повторного
+    нажатия кнопки)."""
+    if workday_started(tg_id):
+        return False
+    ws = workday_sheet()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    ws.append_row([today_str(), tg_id, full_name, now, ""])
+    invalidate_cache("workday")
+    return True
+
+def workday_mark_end(tg_id):
+    """Отмечает конец рабочего дня в уже существующей строке на сегодня."""
+    ws = workday_sheet()
+    records = safe_records(ws, WH)
+    for i, r in enumerate(records, start=2):
+        if str(r["tg_id"]) == str(tg_id) and r["date"] == today_str():
+            if r.get("end_at"):
+                return False  # уже отмечен
+            ws.update_cell(i, WH.index("end_at") + 1, datetime.now().strftime("%Y-%m-%d %H:%M"))
+            invalidate_cache("workday")
+            return True
+    return False
+
 def records_for_week(ws_name, headers):
     ws = sheet(ws_name)
     iso = datetime.now().strftime("%Y-W%W")
@@ -404,11 +477,13 @@ COMMAND_REGISTRY = [
         "group": "📋 Ежедневная работа",
         "role": "employee",
         "items": [
+            ("/startday", "начать рабочий день (запросит план)"),
             ("/plan", "план на день"),
             ("/mytasks", "мои активные задачи"),
             ("/changestatus", "сменить статус задачи"),
             ("/done", "отметить выполненной"),
-            ("/eod", "закрыть день"),
+            ("/endday", "актуализировать статусы и закрыть день"),
+            ("/eod", "закрыть день вручную"),
         ],
     },
     {
@@ -440,7 +515,9 @@ COMMAND_REGISTRY = [
             ("/setdepthead", "назначить руководителя отдела"),
             ("/setfounder", "назначить учредителя"),
             ("/setdept", "сменить отдел сотрудника"),
+            ("/setshift", "назначить график (стандартный/сдвинутый)"),
             ("/recovertasks", "восстановить задачи из планов"),
+            ("/testdigest", "диагностика отправки сводки в группу"),
             ("/fixname", "исправить имя сотрудника"),
             ("/fixallnames", "нормализовать все имена"),
             ("/fixsheets", "аварийный ремонт таблиц"),
@@ -474,27 +551,48 @@ def format_commands_text(role: str) -> str:
 # не через текст: каждая карточка кончается кнопкой "Попробовать сейчас".
 LEARN_SCENARIOS = [
     {
-        "id": "plan", "role": "employee", "label": "📝 Как написать план", "version": 1,
+        "id": "startday", "role": "employee", "label": "☀️ Как начать рабочий день", "version": 1,
+        "text": (
+            "☀️ <b>Как начать рабочий день</b>\n\n"
+            "Отметь начало рабочего дня командой /startday в любой момент,"
+            " когда реально приступаешь к работе.\n\n"
+            "Если не отметишь сам — бот напомнит в 10:00 (или в 11:00, если "
+            "у тебя сдвинутый график), и повторит напоминание ещё раз через "
+            "30 минут.\n\n"
+            "<i>Подсказка: сразу после старта бот попросит план на день —"
+            " это один шаг, не два отдельных.</i>"
+        ),
+        "try_cmd": "/startday",
+    },
+    {
+        "id": "plan", "role": "employee", "label": "📝 Как написать план", "version": 2,
         "text": (
             "📝 <b>Как написать план</b>\n\n"
-            "Каждое утро в 11:00 бот сам спросит план.\n"
+            "План запрашивается сразу после того, как ты отметил(а) начало "
+            "рабочего дня через /startday — не в фиксированное время для всех.\n"
             "Просто напиши список дел — каждая строка станет отдельной задачей.\n\n"
             "Если срок не сегодня — добавь дату в конце строки: [25.06.2026]\n\n"
             "<i>Пример:</i>\n"
             "Согласовать смету\n"
-            "Позвонить поставщику [25.06.2026]"
+            "Позвонить поставщику [25.06.2026]\n\n"
+            "<i>Подсказка: если есть просроченные задачи из прошлых дней,"
+            " бот сразу предложит их актуализировать.</i>"
         ),
         "try_cmd": "/plan",
     },
     {
-        "id": "eod", "role": "employee", "label": "✅ Как закрыть день", "version": 1,
+        "id": "eod", "role": "employee", "label": "✅ Как закрыть день", "version": 2,
         "text": (
             "✅ <b>Как закрыть день</b>\n\n"
-            "В 19:00 бот сам спросит статус по каждой задаче из плана.\n"
+            "Отметь конец рабочего дня командой /endday — это запустит опрос "
+            "статуса по каждой задаче из плана.\n"
             "Для каждой: выбери статус кнопкой → выбери канал кнопкой → напиши комментарий.\n\n"
-            "Не хочешь ждать до вечера — запусти вручную в любой момент."
+            "Если не отметишь сам — бот спросит в 19:00 (или в 22:00 для "
+            "сдвинутого графика), с повтором через 30 минут.\n\n"
+            "<i>Подсказка: день засчитывается закрытым только после того,"
+            " как все статусы актуализированы — не раньше.</i>"
         ),
-        "try_cmd": "/eod",
+        "try_cmd": "/endday",
     },
     {
         "id": "task", "role": "employee", "label": "📌 Как поставить задачу", "version": 1,
@@ -554,9 +652,9 @@ LEARN_SCENARIOS = [
 ]
 
 ROLE_LEARNING_SEQUENCE = {
-    "employee":  ["plan", "eod", "task", "tag", "changestatus"],
-    "dept_head": ["plan", "eod", "task", "tag", "changestatus", "menu", "remind"],
-    "admin":     ["plan", "eod", "task", "tag", "changestatus", "menu", "remind", "export"],
+    "employee":  ["startday", "plan", "eod", "task", "tag", "changestatus"],
+    "dept_head": ["startday", "plan", "eod", "task", "tag", "changestatus", "menu", "remind"],
+    "admin":     ["startday", "plan", "eod", "task", "tag", "changestatus", "menu", "remind", "export"],
 }
 
 def learn_scenarios_for_role(role: str) -> list:
@@ -798,6 +896,14 @@ def tasks_for_user(tg_id):
     return [r for r in tasks_all()
             if str(r["assigned_to_id"]) == str(tg_id) and r["status"] not in ("done",)]
 
+def tasks_overdue_for_user(tg_id):
+    """Просроченные задачи конкретного сотрудника (не done, дедлайн в прошлом).
+    Используется при внесении нового плана, чтобы предложить актуализировать
+    статус старых просрочек прежде чем плодить новые задачи поверх них."""
+    today = today_str()
+    return [r for r in tasks_for_user(tg_id)
+            if r.get("deadline","") and r["deadline"] < today]
+
 def tasks_open():
     return [r for r in tasks_all_real() if r["status"] in ("open","in_progress","paused")]
 
@@ -954,6 +1060,39 @@ async def cmd_ping(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"Запущен: {PROCESS_STARTED_AT.strftime('%d.%m.%Y %H:%M:%S')} МСК "
         f"({hours}ч {minutes}мин назад)"
     )
+
+async def cmd_testdigest(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    Диагностика отправки сводного отчёта в групповой чат (ADMIN_CHAT_ID).
+    Раньше ошибка отправки только тихо логировалась (logger.warning) и
+    проглатывалась — если бот не состоит в группе, потерял права писать,
+    или ADMIN_CHAT_ID указывает не туда, сводка просто не приходила без
+    единого видимого следа. Эта команда сразу показывает настоящую причину.
+    """
+    if not emp_is_admin(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ Только для администраторов."); return
+    await update.effective_message.reply_text(
+        f"🔍 Проверяю отправку в группу руководителей...\nADMIN_CHAT_ID: <code>{ADMIN_CHAT_ID}</code>",
+        parse_mode="HTML"
+    )
+    try:
+        chat = await ctx.bot.get_chat(ADMIN_CHAT_ID)
+        await ctx.bot.send_message(
+            ADMIN_CHAT_ID,
+            f"✅ Тестовое сообщение от бота.\nОтправлено: {datetime.now(TZ).strftime('%d.%m.%Y %H:%M:%S')} МСК"
+        )
+        await update.effective_message.reply_text(
+            f"✅ Успешно! Группа: «{chat.title}» (id {chat.id}). Сообщение доставлено."
+        )
+    except Exception as ex:
+        await update.effective_message.reply_text(
+            f"❌ Не удалось отправить в ADMIN_CHAT_ID={ADMIN_CHAT_ID}.\n\n"
+            f"Причина: <code>{ex}</code>\n\n"
+            f"Частые причины: бота удалили из группы, группу превратили в "
+            f"супергруппу (id меняется), у бота нет прав писать сообщения, "
+            f"или ADMIN_CHAT_ID в Variables на Railway указывает на старый чат.",
+            parse_mode="HTML"
+        )
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/help — список команд по роли в любой момент, не только при регистрации.
@@ -1161,6 +1300,25 @@ async def recv_plan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         learn_kb = pop_learning_continue_keyboard(tg_id)
         await update.message.reply_text("✅ План записан! Увидимся в 19:00 🌆", reply_markup=learn_kb)
+
+    # актуализация статусов по старым просроченным задачам — не даём им
+    # просто копиться под новым планом без внимания
+    if not is_training:
+        overdue = tasks_overdue_for_user(tg_id)
+        if overdue:
+            ob_lines = [f"⚠️ <b>У тебя {len(overdue)} просроченных задач из прошлых дней.</b>",
+                        "Актуализируй статус, прежде чем начинать новый день:\n"]
+            buttons = []
+            for t in overdue[:15]:
+                label = f"{t['title'][:38]}" + ("…" if len(t['title']) > 38 else "") + f" (до {fmt_dl(t['deadline'])})"
+                buttons.append([InlineKeyboardButton(label, callback_data=f"chstatustask_{t['task_id']}")])
+            await update.message.reply_text(
+                "\n".join(ob_lines), parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(buttons)
+            )
+            if len(overdue) > 15:
+                await update.message.reply_text(f"…и ещё {len(overdue)-15}. Используй /changestatus для полного списка.")
+
     return ConversationHandler.END
 
 async def cb_confirm_plan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1462,6 +1620,11 @@ async def finish_eod(message, ctx, tg_id):
         summary = f"EOD пройден: {done_c}/{total_c} задач выполнено"
         save_report(tg_id, u["full_name"], summary)
 
+    # Конец рабочего дня фиксируется только теперь — после реальной
+    # актуализации статусов, не просто по факту намерения закончить.
+    if u and not _learning_in_progress.get(tg_id) == "eod":
+        workday_mark_end(tg_id)
+
     learn_kb = pop_learning_continue_keyboard(tg_id)
     await message.reply_text(
         f"✅ День закрыт! Выполнено {done_c} из {total_c} задач.{streak_line}\n\n"
@@ -1473,6 +1636,39 @@ async def finish_eod(message, ctx, tg_id):
 async def cmd_eod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not emp_registered(update.effective_user.id):
         await update.effective_message.reply_text("Сначала /start"); return
+    await start_eod_flow(ctx.bot, update.effective_user.id)
+
+async def cmd_startday(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    /startday — сотрудник самостоятельно отмечает начало рабочего дня в любой
+    момент. Сразу запускает запрос плана (заменяет старый фиксированный
+    автозапрос в 11:00 — теперь план запрашивается по факту начала дня,
+    не по единому времени для всех).
+    """
+    if update.callback_query:
+        await update.callback_query.answer()
+    tg_id = update.effective_user.id
+    if not emp_registered(tg_id):
+        await update.effective_message.reply_text("Сначала /start"); return ConversationHandler.END
+    u = emp_by_id(tg_id)
+    marked = workday_mark_start(tg_id, u["full_name"])
+    if not marked:
+        await update.effective_message.reply_text("✅ Ты уже отметил(а) начало рабочего дня сегодня.")
+        return ConversationHandler.END
+    await update.effective_message.reply_text(f"☀️ Рабочий день начат! {datetime.now(TZ).strftime('%H:%M')} МСК")
+    return await cmd_plan(update, ctx)
+
+async def cmd_endday(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    /endday — запускает актуализацию статусов задач (EOD). Сама отметка конца
+    рабочего дня фиксируется ПОСЛЕ завершения EOD-опроса (внутри finish_eod),
+    не сразу при нажатии — конец дня засчитывается только когда статусы
+    реально актуализированы, не просто по факту намерения закончить.
+    """
+    if not emp_registered(update.effective_user.id):
+        await update.effective_message.reply_text("Сначала /start"); return
+    if workday_ended(update.effective_user.id):
+        await update.effective_message.reply_text("✅ Ты уже завершил(а) рабочий день сегодня."); return
     await start_eod_flow(ctx.bot, update.effective_user.id)
 
 # ── /task ─────────────────────────────────────────────────────────────────────
@@ -2431,6 +2627,58 @@ async def cb_setdeptemp_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"Выбери отдел для {emp['full_name']}:",
         reply_markup=dept_keyboard("admset_dept_", target_tg_id)
     )
+
+async def cmd_setshift(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    /setshift — диалоговый выбор: сотрудник из списка → график (стандартный
+    10:00–19:00 / сдвинутый 11:00–22:00), кнопками. Назначает, во сколько
+    конкретному сотруднику бот будет спрашивать старт/конец рабочего дня.
+    """
+    if not emp_is_admin(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ Только для администраторов."); return
+    emps = emp_employees()
+    if not emps:
+        await update.effective_message.reply_text("Нет зарегистрированных сотрудников."); return
+    buttons = []
+    row = []
+    for e in emps:
+        shift = emp_shift(int(e["tg_id"]))
+        mark = " 🌙" if shift["start_hour"] == 11 else ""
+        row.append(InlineKeyboardButton(e["full_name"]+mark, callback_data=f"setshiftemp_{e['tg_id']}"))
+        if len(row) == 2:
+            buttons.append(row); row = []
+    if row: buttons.append(row)
+    await update.effective_message.reply_text(
+        "Кому изменить график? (🌙 — уже сдвинутый 11:00–22:00)",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+async def cb_setshiftemp_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Выбран сотрудник — показываем кнопки графика."""
+    query = update.callback_query; await query.answer()
+    if not emp_is_admin(query.from_user.id):
+        await query.answer("⛔ Только для администраторов.", show_alert=True); return
+    target_tg_id = query.data.replace("setshiftemp_", "", 1)
+    emp = emp_by_id(int(target_tg_id))
+    if not emp:
+        await query.message.reply_text("Сотрудник не найден."); return
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("☀️ Стандартный 10:00–19:00", callback_data=f"setshiftval_standard_{target_tg_id}")],
+        [InlineKeyboardButton("🌙 Сдвинутый 11:00–22:00", callback_data=f"setshiftval_shifted_{target_tg_id}")],
+    ])
+    await query.message.reply_text(f"Выбери график для {emp['full_name']}:", reply_markup=keyboard)
+
+async def cb_setshiftval_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Применяем выбранный график."""
+    query = update.callback_query; await query.answer("✅ Сохранено")
+    if not emp_is_admin(query.from_user.id):
+        await query.answer("⛔ Только для администраторов.", show_alert=True); return
+    rest = query.data.replace("setshiftval_", "", 1)
+    code, target_tg_id = rest.split("_", 1)
+    emp_set_shift_schedule(int(target_tg_id), code)
+    emp = emp_by_id(int(target_tg_id))
+    label = "Стандартный (10:00–19:00)" if code == "standard" else "Сдвинутый (11:00–22:00)"
+    await query.edit_message_text(f"✅ {emp['full_name']}: график «{label}»")
 
 async def cmd_fixname(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/fixname @username Имя Фамилия — вручную исправить порядок имени/фамилии."""
@@ -3433,33 +3681,78 @@ async def cb_dynamics_dept(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await reply_long_text(query.message, lines, parse_mode="HTML", reply_markup=keyboard)
 
 # ── NOTIFICATIONS ─────────────────────────────────────────────────────────────
-async def job_request_plans(bot: Bot):
-    logger.info("job_request_plans: triggered")
-    sent = 0
+# Счётчик отправленных напоминаний о старте дня за сегодня, чтобы не слать
+# больше 2 повторов с интервалом 30 минут (module-level, сбрасывается сам
+# по себе раз в день, так как ключ — today_str(), старые даты просто не
+# совпадают и накопления не происходит при разумном перезапуске).
+_startday_reminder_count = {}  # f"{tg_id}:{date}" -> count
+
+async def job_check_workday_start(bot: Bot):
+    """
+    Каждые 30 минут проверяет, у кого наступило время старта рабочего дня
+    по их графику (10:00 стандартный, 11:00 сдвинутый) и старт не отмечен.
+    Шлёт вопрос с кнопкой 'Начать рабочий день'. Эскалация: максимум 2
+    напоминания с интервалом 30 минут, дальше не дёргает — взрослые люди,
+    дальнейшие настойчивые пинги контрпродуктивны.
+    """
+    now = datetime.now(APZ)
+    today = today_str()
     for e in emp_employees():
-        if has_plan_today(int(e["tg_id"])): continue
+        tg_id = int(e["tg_id"])
+        if workday_started(tg_id):
+            continue
+        shift = emp_shift(tg_id)
+        start_dt = now.replace(hour=shift["start_hour"], minute=shift["start_minute"], second=0, microsecond=0)
+        if now < start_dt:
+            continue  # рабочий день для этого человека ещё не наступил
+
+        key = f"{tg_id}:{today}"
+        count = _startday_reminder_count.get(key, 0)
+        if count >= 2:
+            continue  # уже напомнили дважды, дальше не дёргаем
+
         try:
-            await bot.send_message(int(e["tg_id"]),
-                f"☀️ Доброе утро, {e['full_name']}!\nНапиши план на день: /plan\n"
-                "Каждый пункт — отдельная задача в трекере.")
-            sent += 1
-        except Exception as ex: logger.warning(f"request_plans: {ex}")
-    logger.info(f"job_request_plans: done, sent to {sent} employees")
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("☀️ Начать рабочий день", callback_data="startday_btn"),
+            ]])
+            text = ("☀️ Доброе утро! Отметь начало рабочего дня:" if count == 0
+                    else "🔔 Напоминание: ты ещё не отметил(а) начало рабочего дня.")
+            await bot.send_message(tg_id, text, reply_markup=keyboard)
+            _startday_reminder_count[key] = count + 1
+        except Exception as ex:
+            logger.warning(f"check_workday_start {tg_id}: {ex}")
 
-async def job_remind_plans(bot: Bot):
-    for e in emp_employees():
-        if not has_plan_today(int(e["tg_id"])):
-            try:
-                await bot.send_message(int(e["tg_id"]),
-                    "🔔 Напоминание: напиши план на день /plan")
-            except Exception as ex: logger.warning(f"remind_plans: {ex}")
+_endday_reminder_count = {}  # f"{tg_id}:{date}" -> count, аналогично старту дня
 
-async def job_request_eod(bot: Bot):
-    """19:00 — запускаем EOD-опрос для всех сотрудников."""
-    logger.info("job_request_eod: triggered")
+async def job_check_workday_end(bot: Bot):
+    """
+    Каждые 30 минут проверяет, у кого наступило время конца рабочего дня по
+    их графику (19:00 стандартный, 22:00 сдвинутый) и день ещё не закрыт.
+    Запускает EOD-опрос автоматически — это заменяет старый единый
+    job_request_eod в 19:00 для всех. Эскалация: максимум 2 запуска с
+    интервалом 30 минут, если сотрудник не реагирует на первый.
+    """
+    now = datetime.now(APZ)
+    today = today_str()
     for e in emp_employees():
-        await start_eod_flow(bot, int(e["tg_id"]))
-    logger.info("job_request_eod: done")
+        tg_id = int(e["tg_id"])
+        if workday_ended(tg_id):
+            continue
+        shift = emp_shift(tg_id)
+        end_dt = now.replace(hour=shift["end_hour"], minute=shift["end_minute"], second=0, microsecond=0)
+        if now < end_dt:
+            continue
+
+        key = f"{tg_id}:{today}"
+        count = _endday_reminder_count.get(key, 0)
+        if count >= 2:
+            continue
+
+        try:
+            await start_eod_flow(bot, tg_id)
+            _endday_reminder_count[key] = count + 1
+        except Exception as ex:
+            logger.warning(f"check_workday_end {tg_id}: {ex}")
 
 async def job_learning_reminder(bot: Bot):
     """
@@ -3584,7 +3877,20 @@ async def job_daily_digest(bot: Bot):
     try:
         await send_long_text(bot, ADMIN_CHAT_ID, lines,
                                parse_mode="HTML", reply_markup=build_admin_keyboard())
-    except Exception as ex: logger.warning(f"daily_digest: {ex}")
+    except Exception as ex:
+        logger.warning(f"daily_digest: {ex}")
+        # дублируем ошибку лично каждому admin — иначе провал отправки в
+        # группу остаётся видимым только в логах Railway, которые никто
+        # не читает в реальном времени
+        for adm in emp_admins():
+            try:
+                await bot.send_message(
+                    int(adm["tg_id"]),
+                    f"⚠️ Не удалось отправить сводку в группу руководителей.\n"
+                    f"Причина: {ex}\n\nПроверь /testdigest для диагностики."
+                )
+            except Exception:
+                pass
 
     # ── Персональная сводка по отделу для каждого dept_head ──
     for head in emp_dept_heads():
@@ -3687,11 +3993,13 @@ def build_scheduler(bot: Bot):
         # ровно в момент срабатывания задания, APScheduler всё равно выполнит его
         # в течение 15 минут после восстановления, а не молча пропустит до следующего дня.
         s.add_job(fn, CronTrigger(timezone=APZ, **kw), args=[bot], misfire_grace_time=900)
-    j(job_request_plans,   day_of_week="mon-fri", hour=11, minute=0)
-    j(job_remind_plans,    day_of_week="mon-fri", hour=11, minute=30)
+    # Старт/конец рабочего дня теперь проверяются каждые 30 минут в рабочем
+    # окне 10:00–22:30, чтобы покрыть и стандартный график (10:00–19:00),
+    # и сдвинутый (11:00–22:00) — раньше было одно фиксированное время для всех.
+    j(job_check_workday_start, day_of_week="mon-fri", hour="10-21", minute="0,30")
+    j(job_check_workday_end,   day_of_week="mon-fri", hour="19-22", minute="0,30")
     j(job_ping_deadlines,  day_of_week="mon-fri", hour=10, minute=0)
     j(job_learning_reminder, day_of_week="mon-fri", hour=14, minute=0)
-    j(job_request_eod,     day_of_week="mon-fri", hour=19, minute=0)
     j(job_daily_digest,    day_of_week="mon-fri", hour=19, minute=35)
     j(job_weekly_audit,    day_of_week="fri",     hour=18, minute=0)
     j(job_monthly_audit,   day=28,                hour=17, minute=0)
@@ -3706,7 +4014,9 @@ async def post_init(app):
         ("start",     "Регистрация / меню"),
         ("ping",      "Проверка что бот на связи"),
         ("help",      "Список команд и обучение"),
+        ("startday",  "Начать рабочий день — запросит план"),
         ("plan",      "План на день — поддерживает [ДД.ММ.ГГГГ] для другого срока"),
+        ("endday",    "Актуализировать статусы и закрыть рабочий день"),
         ("eod",       "Закрыть день — статусы задач"),
         ("task",      "Поставить задачу — выбор отдела и сотрудника кнопками"),
         ("tag",       "Тег канала для задачи: /tag — выбор кнопками"),
@@ -3725,6 +4035,7 @@ async def post_init(app):
         ("setdepthead", "Назначить руководителя отдела: /setdepthead @username"),
         ("setfounder", "Назначить учредителя: /setfounder @username"),
         ("setdept", "Сменить отдел сотрудника: /setdept @username"),
+        ("setshift", "Назначить график работы сотруднику"),
         ("fixname", "Исправить имя: /fixname @username Имя Фамилия"),
         ("fixallnames", "Нормализовать имена всех сотрудников"),
     ])
@@ -3756,6 +4067,8 @@ def main():
         entry_points=[
             CommandHandler("plan", cmd_plan),
             CallbackQueryHandler(cmd_plan, pattern="^learntry_plan$"),
+            CommandHandler("startday", cmd_startday),
+            CallbackQueryHandler(cmd_startday, pattern="^startday_btn$"),
         ],
         states={S_PLAN: [MessageHandler(filters.TEXT & ~filters.COMMAND, recv_plan)]},
         fallbacks=[cancel],
@@ -3776,6 +4089,7 @@ def main():
     ), group=1)
 
     app.add_handler(CommandHandler("eod",       cmd_eod))
+    app.add_handler(CommandHandler("endday",    cmd_endday))
     app.add_handler(CommandHandler("done",      cmd_done))
     app.add_handler(CommandHandler("changestatus", cmd_changestatus))
     app.add_handler(CommandHandler("status",    cmd_status))
@@ -3786,12 +4100,14 @@ def main():
     app.add_handler(CommandHandler("setdepthead", cmd_setdepthead))
     app.add_handler(CommandHandler("setfounder", cmd_setfounder))
     app.add_handler(CommandHandler("setdept", cmd_setdept))
+    app.add_handler(CommandHandler("setshift", cmd_setshift))
     app.add_handler(CommandHandler("fixsheets", cmd_fixsheets))
     app.add_handler(CommandHandler("fixname", cmd_fixname))
     app.add_handler(CommandHandler("fixallnames", cmd_fixallnames))
     app.add_handler(CommandHandler("edit", cmd_edit))
     app.add_handler(CommandHandler("tag", cmd_tag))
     app.add_handler(CommandHandler("ping", cmd_ping))
+    app.add_handler(CommandHandler("testdigest", cmd_testdigest))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("learningreport", cmd_learningreport))
     app.add_handler(CommandHandler("checkstatuses", cmd_checkstatuses))
@@ -3817,6 +4133,8 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_admset_head,         pattern="^admset_head_"))
     app.add_handler(CallbackQueryHandler(cb_admset_dept,         pattern="^admset_dept_"))
     app.add_handler(CallbackQueryHandler(cb_setdeptemp_pick,     pattern="^setdeptemp_"))
+    app.add_handler(CallbackQueryHandler(cb_setshiftemp_pick,    pattern="^setshiftemp_"))
+    app.add_handler(CallbackQueryHandler(cb_setshiftval_pick,    pattern="^setshiftval_"))
     app.add_handler(CallbackQueryHandler(cb_donetask_pick,       pattern="^donetask_"))
     app.add_handler(CallbackQueryHandler(cb_changestatus_task_pick, pattern="^chstatustask_"))
     app.add_handler(CallbackQueryHandler(cb_changestatus_apply,     pattern="^chstatus_"))
