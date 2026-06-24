@@ -1431,15 +1431,23 @@ def status_keyboard(task_id: str) -> InlineKeyboardMarkup:
         ],
     ])
 
-async def start_eod_flow(bot: Bot, tg_id: int):
+async def start_eod_flow(bot: Bot, tg_id: int, training_task_ids=None):
     """
     Запускает опрос статусов задач для сотрудника.
     Важно: эта функция вызывается и из обработчиков команд (где доступен ctx.bot_data),
     и из фоновых заданий APScheduler (где доступен только сам bot, без ctx).
     Поэтому состояние EOD-сессии хранится в module-level _eod_state, а не в
     ctx.bot_data/bot.bot_data — это единое хранилище, видимое из обоих мест.
+
+    training_task_ids: если указан, опрос проходит только по этим конкретным
+    задачам (используется тренажёром обучения), а не по всем реальным
+    активным задачам пользователя — это изолирует обучение от рабочих данных.
     """
-    tasks = tasks_today_for_user(tg_id)
+    if training_task_ids:
+        tasks = [task_by_id(tid) for tid in training_task_ids]
+        tasks = [t for t in tasks if t]
+    else:
+        tasks = tasks_today_for_user(tg_id)
     if not tasks:
         try:
             learn_kb = pop_learning_continue_keyboard(tg_id)
@@ -1553,10 +1561,11 @@ async def recv_eod_comment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     text = update.message.text.strip()
 
-    # ищем ссылку в тексте
+    # ищем ВСЕ ссылки в тексте — у задачи может быть несколько результатов
+    # (документ + фото + переписка), раньше сохранялась только первая
     url_pattern = r'https?://\S+'
     links = re.findall(url_pattern, text)
-    link = links[0] if links else ""
+    link = "\n".join(links) if links else ""
     comment = re.sub(url_pattern, "", text).strip()
 
     task_update_comment(task_id, comment, link)
@@ -1648,16 +1657,19 @@ async def finish_eod(message, ctx, tg_id):
             streak_line = "\n🌱 Отличное начало серии — продолжай завтра!"
 
     u = emp_by_id(tg_id)
-    if u and not has_report_today(tg_id):
+    is_training_eod = _learning_in_progress.get(tg_id) == "eod"
+    if u and not has_report_today(tg_id) and not is_training_eod:
         summary = f"EOD пройден: {done_c}/{total_c} задач выполнено"
         save_report(tg_id, u["full_name"], summary)
 
     # Конец рабочего дня фиксируется только теперь — после реальной
     # актуализации статусов, не просто по факту намерения закончить.
-    if u and not _learning_in_progress.get(tg_id) == "eod":
+    if u and not is_training_eod:
         workday_mark_end(tg_id)
 
     learn_kb = pop_learning_continue_keyboard(tg_id)
+    if is_training_eod:
+        delete_training_tasks(tg_id)
     await message.reply_text(
         f"✅ День закрыт! Выполнено {done_c} из {total_c} задач.{streak_line}\n\n"
         "Хорошего вечера! 🌙",
@@ -1666,9 +1678,31 @@ async def finish_eod(message, ctx, tg_id):
 
 # ── /eod — запуск вручную ────────────────────────────────────────────────────
 async def cmd_eod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not emp_registered(update.effective_user.id):
+    tg_id = update.effective_user.id
+    if not emp_registered(tg_id):
         await update.effective_message.reply_text("Сначала /start"); return
-    await start_eod_flow(ctx.bot, update.effective_user.id)
+
+    is_training = False
+    if update.callback_query and update.callback_query.data == "learntry_eod":
+        mark_learning_action(tg_id, "eod")
+        is_training = True
+
+    if is_training:
+        # Тренажёр: создаём 2 изолированные тестовые задачи вместо того,
+        # чтобы запускать опрос по всем реальным активным задачам сотрудника
+        # (раньше тут подставлялись настоящие рабочие задачи целиком — баг).
+        u = emp_by_id(tg_id)
+        today = today_str()
+        demo_titles = ["Учебная задача: позвонить клиенту", "Учебная задача: подготовить отчёт"]
+        demo_ids = []
+        for title in demo_titles:
+            tid = task_create(tg_id, u["full_name"], tg_id, u["full_name"],
+                              title, today, source="plan", is_training=True)
+            demo_ids.append(tid)
+        await start_eod_flow(ctx.bot, tg_id, training_task_ids=demo_ids)
+        return
+
+    await start_eod_flow(ctx.bot, tg_id)
 
 async def cmd_startday(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """
@@ -2051,7 +2085,10 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
           "done":"✅ Выполнена","overdue":"🔴 Просрочена","paused":"⏸ Приостановлено"}
     dl = task["deadline"]
     dl_fmt = dl[8:]+"."+dl[5:7]+"."+dl[:4] if dl else "—"
-    link_line = f"\n🔗 {task['result_link']}" if task.get("result_link") else ""
+    link_line = ""
+    if task.get("result_link"):
+        link_lines = task["result_link"].split("\n")
+        link_line = "\n" + "\n".join(f"🔗 {l}" for l in link_lines if l)
     comment_line = f"\n💬 {task['comment']}" if task.get("comment") else ""
     tag_line = f"\n🏷 {task['channel']}" if task.get("channel") else ""
     await update.effective_message.reply_text(
@@ -3607,7 +3644,9 @@ async def cb_summary_person(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             icon = "🔴" if t in overdue else sl.get(t["status"],"🔵")
             src = " <i>(план)</i>" if t.get("source") == "plan" else ""
             comment = f"\n    💬 {t['comment']}" if t.get("comment") else ""
-            link = f"\n    🔗 {t['result_link']}" if t.get("result_link") else ""
+            link = ""
+            if t.get("result_link"):
+                link = "\n" + "\n".join(f"    🔗 {l}" for l in t["result_link"].split("\n") if l)
             lines.append(f"  {icon} {t['title']} — до {fmt_dl(t['deadline'])}{src}{comment}{link}")
     if done_today:
         lines.append(f"\n<b>Выполнено сегодня ({len(done_today)}):</b>")
@@ -3802,12 +3841,17 @@ def build_export_workbook(dept_filter: str, period: str):
         c.alignment = Alignment(horizontal="center")
 
     status_labels = {"open":"Не начато","in_progress":"В работе","paused":"Приостановлено","done":"Выполнено"}
+    link_col_idx = headers.index("Ссылка") + 1 if "Ссылка" in headers else None
     for t in rows:
         ws.append([
             t["task_id"], t["assigned_to_name"], get_dept(t["assigned_to_id"]),
             t["title"], t.get("deadline",""), status_labels.get(t["status"], t["status"]),
             t.get("comment",""), t.get("result_link",""), t.get("source","manual"),
         ])
+        if link_col_idx and t.get("result_link") and "\n" in t["result_link"]:
+            # несколько ссылок в одной ячейке — включаем перенос строк,
+            # иначе Excel сжимает их в нечитаемую сплошную строку
+            ws.cell(row=ws.max_row, column=link_col_idx).alignment = Alignment(wrap_text=True, vertical="top")
 
     widths = [10, 20, 18, 40, 12, 14, 30, 30, 10]
     for i, w in enumerate(widths, start=1):
