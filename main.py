@@ -1756,6 +1756,29 @@ async def cmd_endday(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     tg_id = update.effective_user.id
     if not emp_registered(tg_id):
         await update.effective_message.reply_text("Сначала /start"); return
+
+    is_training = False
+    if update.callback_query and update.callback_query.data == "learntry_eod":
+        mark_learning_action(tg_id, "eod")
+        is_training = True
+
+    if is_training:
+        # Тренажёр: создаём 2 изолированные тестовые задачи вместо того,
+        # чтобы запускать опрос по всем реальным активным задачам сотрудника.
+        # Кнопка 'Попробовать /endday' из карточки обучения вызывает именно
+        # cmd_endday (не cmd_eod) — это была реальная причина бага: изоляция
+        # тренажёра была добавлена в cmd_eod, которую этот путь не вызывает.
+        u = emp_by_id(tg_id)
+        today = today_str()
+        demo_titles = ["Учебная задача: позвонить клиенту", "Учебная задача: подготовить отчёт"]
+        demo_ids = []
+        for title in demo_titles:
+            tid = task_create(tg_id, u["full_name"], tg_id, u["full_name"],
+                              title, today, source="plan", is_training=True)
+            demo_ids.append(tid)
+        await start_eod_flow(ctx.bot, tg_id, training_task_ids=demo_ids)
+        return
+
     if workday_ended(tg_id):
         # День уже реально закрыт — это нормально, если человек уже работал
         # до обучения. Засчитываем шаг, не оставляем пользователя в тупике
