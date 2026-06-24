@@ -509,6 +509,7 @@ COMMAND_REGISTRY = [
         "items": [
             ("/menu", "все функции отдела/команды кнопками"),
             ("/team", "кто сдал план сегодня"),
+            ("/workday", "кто во сколько начал/закончил день"),
             ("/tasks_all", "все задачи текстом"),
             ("/checkstatuses", "запросить статусы прямо сейчас"),
             ("/learningreport", "прогресс обучения команды"),
@@ -1677,9 +1678,23 @@ async def cmd_startday(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text("Сначала /start"); return ConversationHandler.END
     u = emp_by_id(tg_id)
     marked = workday_mark_start(tg_id, u["full_name"])
+
     if not marked:
+        # День уже был отмечен раньше — это нормально, если человек реально
+        # начал работать до того, как зашёл в обучение/нажал кнопку повторно.
+        # Шаг обучения всё равно нужно засчитать (цель — научить пользоваться
+        # командой, а не заставить физически переотмечать уже начатый день) —
+        # без этого пользователь застревал бы тут навсегда.
+        in_learning = _learning_in_progress.get(tg_id) == "startday"
         await update.effective_message.reply_text("✅ Ты уже отметил(а) начало рабочего дня сегодня.")
+        if in_learning:
+            learn_kb = pop_learning_continue_keyboard(tg_id)
+            await update.effective_message.reply_text(
+                "Это нормально — в реальной работе ты обычно отмечаешь старт только один раз в день.",
+                reply_markup=learn_kb
+            )
         return ConversationHandler.END
+
     await update.effective_message.reply_text(f"☀️ Рабочий день начат! {datetime.now(TZ).strftime('%H:%M')} МСК")
     return await cmd_plan(update, ctx)
 
@@ -1690,11 +1705,23 @@ async def cmd_endday(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     не сразу при нажатии — конец дня засчитывается только когда статусы
     реально актуализированы, не просто по факту намерения закончить.
     """
-    if not emp_registered(update.effective_user.id):
+    tg_id = update.effective_user.id
+    if not emp_registered(tg_id):
         await update.effective_message.reply_text("Сначала /start"); return
-    if workday_ended(update.effective_user.id):
-        await update.effective_message.reply_text("✅ Ты уже завершил(а) рабочий день сегодня."); return
-    await start_eod_flow(ctx.bot, update.effective_user.id)
+    if workday_ended(tg_id):
+        # День уже реально закрыт — это нормально, если человек уже работал
+        # до обучения. Засчитываем шаг, не оставляем пользователя в тупике
+        # (тот же класс проблемы, что был в cmd_startday).
+        in_learning = _learning_in_progress.get(tg_id) == "eod"
+        await update.effective_message.reply_text("✅ Ты уже завершил(а) рабочий день сегодня.")
+        if in_learning:
+            learn_kb = pop_learning_continue_keyboard(tg_id)
+            await update.effective_message.reply_text(
+                "Это нормально — в реальной работе день закрывается один раз.",
+                reply_markup=learn_kb
+            )
+        return
+    await start_eod_flow(ctx.bot, tg_id)
 
 # ── /task ─────────────────────────────────────────────────────────────────────
 def parse_task(text):
@@ -2247,7 +2274,10 @@ def build_dept_head_keyboard():
             InlineKeyboardButton("👤 По сотруднику",    callback_data="summary_person_list"),
         ],
         [
+            InlineKeyboardButton("🕐 Рабочий день",     callback_data="workday_summary"),
             InlineKeyboardButton("📅 За неделю",        callback_data="period_week"),
+        ],
+        [
             InlineKeyboardButton("📅 За месяц",         callback_data="period_month"),
         ],
         [
@@ -2297,7 +2327,10 @@ def build_founder_keyboard():
             InlineKeyboardButton("👤 По сотруднику",    callback_data="summary_person_list"),
         ],
         [
+            InlineKeyboardButton("🕐 Рабочий день",     callback_data="workday_summary"),
             InlineKeyboardButton("📅 За неделю",        callback_data="period_week"),
+        ],
+        [
             InlineKeyboardButton("📅 За месяц",         callback_data="period_month"),
         ],
         [
@@ -2758,6 +2791,55 @@ async def cmd_team(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
     await reply_long_text(update.effective_message, lines, parse_mode="HTML")
 
+async def cmd_workday(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/workday — текстовая версия сводки 'кто во сколько начал/закончил день',
+    альтернатива кнопке 🕐 Рабочий день для тех, кто предпочитает команды."""
+    tg_id = update.effective_user.id
+    if not emp_has_management_access(tg_id):
+        await update.effective_message.reply_text("⛔ Только для руководителей."); return
+    dept_filter = emp_managed_dept(tg_id)
+    employees = emp_employees()
+    if dept_filter:
+        employees = [e for e in employees if get_dept(e["tg_id"]) == dept_filter]
+
+    today_rows = {str(r["tg_id"]): r for r in workday_today()}
+    today_fmt = today_date().strftime("%d.%m.%Y")
+    dept_label = f" — {dept_filter}" if dept_filter else ""
+
+    closed, in_progress, not_started = [], [], []
+    for e in employees:
+        tid = str(e["tg_id"])
+        row = today_rows.get(tid)
+        if not row or not row.get("start_at"):
+            not_started.append(e)
+        elif not row.get("end_at"):
+            in_progress.append((e, row))
+        else:
+            closed.append((e, row))
+
+    def fmt_time(ts: str) -> str:
+        return ts.split(" ")[-1] if ts else "—"
+
+    lines = [f"🕐 <b>Рабочий день{dept_label} — {today_fmt}</b>\n"]
+    if in_progress:
+        lines.append(f"🟢 <b>Сейчас на смене ({len(in_progress)}):</b>")
+        for e, row in sorted(in_progress, key=lambda x: x[1].get("start_at", "")):
+            lines.append(f"  {e['full_name']}: начал {fmt_time(row['start_at'])}")
+        lines.append("")
+    if closed:
+        lines.append(f"⚪ <b>День закрыт ({len(closed)}):</b>")
+        for e, row in sorted(closed, key=lambda x: x[1].get("start_at", "")):
+            lines.append(f"  {e['full_name']}: {fmt_time(row['start_at'])}–{fmt_time(row['end_at'])}")
+        lines.append("")
+    if not_started:
+        lines.append(f"🔴 <b>Не начали день ({len(not_started)}):</b>")
+        for e in not_started:
+            lines.append(f"  {e['full_name']}")
+    if not employees:
+        lines.append("Нет сотрудников для отображения.")
+
+    await reply_long_text(update.effective_message, lines, parse_mode="HTML")
+
 async def cmd_tasks_all(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     tg_id = update.effective_user.id
     if not emp_has_management_access(tg_id):
@@ -3026,8 +3108,8 @@ async def cb_learn_try(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     mark_learning_action(update.callback_query.from_user.id, scenario_id)
 
     dispatch = {
-        "startday": cmd_startday, "plan": cmd_plan, "eod": cmd_eod, "task": cmd_task,
-        "tag": cmd_tag, "changestatus": cmd_changestatus, "menu": cmd_menu,
+        "startday": cmd_startday, "plan": cmd_plan, "eod": cmd_eod, "endday": cmd_endday,
+        "task": cmd_task, "tag": cmd_tag, "changestatus": cmd_changestatus, "menu": cmd_menu,
     }
     handler = dispatch.get(cmd)
     if handler:
@@ -3417,6 +3499,66 @@ async def cb_summary_person_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
     if row: buttons.append(row)
     buttons.append([InlineKeyboardButton("◀️ Назад", callback_data="back_main")])
     await query.message.reply_text("Выбери сотрудника:", reply_markup=InlineKeyboardMarkup(buttons))
+
+async def cb_workday_summary(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    Сводка по команде: кто во сколько начал и закончил рабочий день сегодня.
+    Доступна admin (вся компания), dept_head (свой отдел), founder (вся
+    компания, read-only — кнопка та же, просто без управляющих соседей).
+    """
+    query = update.callback_query; await query.answer()
+    if not is_admin_check(query): return
+    dept_filter = dept_filter_for(query)
+    employees = emp_employees()
+    if dept_filter:
+        employees = [e for e in employees if get_dept(e["tg_id"]) == dept_filter]
+
+    today_rows = {str(r["tg_id"]): r for r in workday_today()}
+    today_fmt = today_date().strftime("%d.%m.%Y")
+    dept_label = f" — {dept_filter}" if dept_filter else ""
+
+    closed, in_progress, not_started = [], [], []
+    for e in employees:
+        tid = str(e["tg_id"])
+        row = today_rows.get(tid)
+        if not row or not row.get("start_at"):
+            not_started.append(e)
+        elif not row.get("end_at"):
+            in_progress.append((e, row))
+        else:
+            closed.append((e, row))
+
+    def fmt_time(ts: str) -> str:
+        # ts вида "2026-06-24 11:06" -> "11:06"
+        return ts.split(" ")[-1] if ts else "—"
+
+    lines = [f"🕐 <b>Рабочий день{dept_label} — {today_fmt}</b>\n"]
+
+    if in_progress:
+        lines.append(f"🟢 <b>Сейчас на смене ({len(in_progress)}):</b>")
+        for e, row in sorted(in_progress, key=lambda x: x[1].get("start_at", "")):
+            lines.append(f"  {e['full_name']}: начал {fmt_time(row['start_at'])}")
+        lines.append("")
+
+    if closed:
+        lines.append(f"⚪ <b>День закрыт ({len(closed)}):</b>")
+        for e, row in sorted(closed, key=lambda x: x[1].get("start_at", "")):
+            lines.append(f"  {e['full_name']}: {fmt_time(row['start_at'])}–{fmt_time(row['end_at'])}")
+        lines.append("")
+
+    if not_started:
+        lines.append(f"🔴 <b>Не начали день ({len(not_started)}):</b>")
+        for e in not_started:
+            lines.append(f"  {e['full_name']}")
+
+    if not employees:
+        lines.append("Нет сотрудников для отображения.")
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Обновить", callback_data="workday_summary")],
+        [InlineKeyboardButton("◀️ Назад", callback_data="back_main")],
+    ])
+    await reply_long_text(query.message, lines, parse_mode="HTML", reply_markup=keyboard)
 
 async def cb_summary_person(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
@@ -4057,6 +4199,7 @@ async def post_init(app):
         ("edit",      "Изменить задачу — выбор кнопками"),
         ("menu",      "Панель руководителя с кнопками"),
         ("team",      "Сводка команды"),
+        ("workday",   "Кто во сколько начал/закончил рабочий день"),
         ("tasks_all", "Все задачи"),
         ("checkstatuses", "Запросить статусы у команды/отдела прямо сейчас"),
         ("learningreport", "Прогресс обучения команды"),
@@ -4146,6 +4289,7 @@ def main():
     app.add_handler(CommandHandler("checkstatuses", cmd_checkstatuses))
     app.add_handler(CommandHandler("recovertasks", cmd_recovertasks))
     app.add_handler(CommandHandler("team",      cmd_team))
+    app.add_handler(CommandHandler("workday",   cmd_workday))
     app.add_handler(CommandHandler("tasks_all", cmd_tasks_all))
 
     # Callbacks
@@ -4182,6 +4326,7 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_show_all_tasks,      pattern="^show_all_tasks$"))
     app.add_handler(CallbackQueryHandler(cb_summary_depts,       pattern="^summary_depts$"))
     app.add_handler(CallbackQueryHandler(cb_summary_person_list, pattern="^summary_person_list$"))
+    app.add_handler(CallbackQueryHandler(cb_workday_summary,     pattern="^workday_summary$"))
     app.add_handler(CallbackQueryHandler(cb_summary_person,      pattern="^person_"))
     app.add_handler(CallbackQueryHandler(cb_period_week,         pattern="^period_week$"))
     app.add_handler(CallbackQueryHandler(cb_period_month,        pattern="^period_month$"))
