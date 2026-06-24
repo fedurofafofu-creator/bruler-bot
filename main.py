@@ -2332,13 +2332,23 @@ async def cmd_mytasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await reply_long_text(update.effective_message, lines, parse_mode="HTML")
 
 # ── ADMIN KEYBOARD ────────────────────────────────────────────────────────────
+def _section_header(label: str):
+    """Кнопка-разделитель — визуально выглядит как заголовок блока внутри
+    клавиатуры, нажатие ничего не делает (callback 'noop'). Telegram не
+    поддерживает настоящие заголовки секций в inline-кнопках, это лучшая
+    доступная имитация, чтобы сгруппировать кнопки по смыслу."""
+    return InlineKeyboardButton(f"▸ {label}", callback_data="noop")
+
 def build_dept_head_keyboard():
     """
     Базовая панель для dept_head и admin: задачи отдела/команды, статусы,
     отчётность по своей зоне видимости. Без чисто административных функций
     (восстановление задач, экспорт, динамика) — это отдельная клавиатура admin.
+    Кнопки сгруппированы по смыслу теми же блоками, что в справочнике:
+    Задачи → Отчётность → Управление командой → Обучение.
     """
     return InlineKeyboardMarkup([
+        [_section_header("ЗАДАЧИ")],
         [
             InlineKeyboardButton("📋 Задачи сегодня",   callback_data="tasks_today"),
             InlineKeyboardButton("📋 Все активные",     callback_data="show_all_tasks"),
@@ -2347,6 +2357,7 @@ def build_dept_head_keyboard():
             InlineKeyboardButton("⚠️ Просроченные",     callback_data="overdue_pick"),
             InlineKeyboardButton("✅ Закрытые задачи",  callback_data="closed_period_pick"),
         ],
+        [_section_header("ОТЧЁТНОСТЬ")],
         [
             InlineKeyboardButton("📊 По отделам",       callback_data="summary_depts"),
             InlineKeyboardButton("👤 По сотруднику",    callback_data="summary_person_list"),
@@ -2358,19 +2369,23 @@ def build_dept_head_keyboard():
         [
             InlineKeyboardButton("📅 За месяц",         callback_data="period_month"),
         ],
+        [_section_header("УПРАВЛЕНИЕ КОМАНДОЙ")],
         [
             InlineKeyboardButton("🔔 Напомнить о задаче", callback_data="remind_task_pick"),
             InlineKeyboardButton("📨 Запросить статусы",   callback_data="checkstatuses_now"),
         ],
+        [_section_header("ОБУЧЕНИЕ")],
         [
             InlineKeyboardButton("📚 Обучение", callback_data="learn_main"),
         ],
     ])
 
 def build_admin_keyboard():
-    """Полная панель для admin: всё из dept_head + чисто административные функции."""
+    """Полная панель для admin: всё из dept_head + чисто административные функции,
+    собранные в отдельный блок «АДМИНИСТРИРОВАНИЕ» в конце."""
     rows = build_dept_head_keyboard().inline_keyboard
     rows = list(rows) + [
+        [_section_header("АДМИНИСТРИРОВАНИЕ")],
         [
             InlineKeyboardButton("📥 Экспорт отдела",      callback_data="export_dept_pick"),
             InlineKeyboardButton("📈 Динамика",            callback_data="dynamics_dept"),
@@ -2389,9 +2404,10 @@ def build_founder_keyboard():
     Read-only панель для учредителя: видит результаты и задачи всей компании,
     как admin, но без единой управляющей кнопки — не напоминает, не
     восстанавливает задачи, не рассылает обучение, не запрашивает статусы.
-    Только просмотр.
+    Только просмотр, сгруппированный по тем же блокам ЗАДАЧИ/ОТЧЁТНОСТЬ.
     """
     return InlineKeyboardMarkup([
+        [_section_header("ЗАДАЧИ")],
         [
             InlineKeyboardButton("📋 Задачи сегодня",   callback_data="tasks_today"),
             InlineKeyboardButton("📋 Все активные",     callback_data="show_all_tasks"),
@@ -2400,6 +2416,7 @@ def build_founder_keyboard():
             InlineKeyboardButton("⚠️ Просроченные",     callback_data="overdue_pick"),
             InlineKeyboardButton("✅ Закрытые задачи",  callback_data="closed_period_pick"),
         ],
+        [_section_header("ОТЧЁТНОСТЬ")],
         [
             InlineKeyboardButton("📊 По отделам",       callback_data="summary_depts"),
             InlineKeyboardButton("👤 По сотруднику",    callback_data="summary_person_list"),
@@ -2537,19 +2554,23 @@ async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         + (f"⚠️ Просроченных: {len(over)}\n" if over else "")
     )
 
-    # У /menu, в отличие от плана/задачи/EOD, нет естественной точки
-    # завершения — это открытый интерфейс с десятком кнопок, не разовое
-    # действие. Поэтому шаг обучения засчитывается сразу при открытии
-    # панели. Три разных сценария обучения ('menu', 'remind', 'export')
-    # все ведут сюда через try_cmd=/menu, у каждого свой callback_data —
-    # нужно проверить и засчитать именно тот, который реально привёл сюда.
+    # У 'menu' нет конкретного действия внутри — сам просмотр панели и есть
+    # цель урока, поэтому он засчитывается сразу при открытии. У 'remind' и
+    # 'export', наоборот, есть конкретное действие внутри панели (нажать
+    # 'Напомнить о задаче' / 'Экспорт') — для них здесь только выставляем
+    # флаг (mark_learning_action), а засчитываем уже на реальной точке
+    # завершения (cb_remind_task_send / экспорт), иначе шаг засчитывался бы
+    # до того, как человек реально попробовал именно ту функцию, про которую
+    # урок, и защита от отправки настоящим людям не успевала бы сработать.
     learn_kb = None
-    if update.callback_query and update.callback_query.data in (
-        "learntry_menu", "learntry_remind", "learntry_export"
+    if update.callback_query and update.callback_query.data == "learntry_menu":
+        mark_learning_action(tg_id, "menu")
+        learn_kb = pop_learning_continue_keyboard(tg_id)
+    elif update.callback_query and update.callback_query.data in (
+        "learntry_remind", "learntry_export"
     ):
         scenario_id = update.callback_query.data.replace("learntry_", "", 1)
         mark_learning_action(tg_id, scenario_id)
-        learn_kb = pop_learning_continue_keyboard(tg_id)
 
     await update.effective_message.reply_text(
         text, parse_mode="HTML", reply_markup=menu_keyboard_for(tg_id)
@@ -3214,6 +3235,12 @@ async def cb_learn_try(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if handler:
         await handler(update, ctx)
 
+async def cb_noop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Кнопки-заголовки разделов внутри /menu — чисто визуальная группировка,
+    нажатие не делает ничего, кроме обязательного answer() (иначе кнопка
+    у пользователя зависнет в состоянии 'загрузка')."""
+    await update.callback_query.answer()
+
 async def cb_back_main(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
     await query.message.reply_text("Выбери действие:", reply_markup=menu_keyboard_for(query.from_user.id))
@@ -3404,10 +3431,19 @@ async def cb_remind_task_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not task:
         await query.message.reply_text("Задача не найдена."); return
 
-    sender = emp_by_id(query.from_user.id)
+    tg_id = query.from_user.id
+    sender = emp_by_id(tg_id)
+    # Если человек ещё проходит этот шаг обучения — напоминание уходит ему
+    # самому, не реальному исполнителю задачи. Без этой защиты предыдущая
+    # версия отправляла настоящее уведомление живому коллеге о реальной
+    # рабочей задаче просто потому, что кто-то изучал функцию.
+    in_remind_lesson = _learning_in_progress.get(tg_id) == "remind"
+    recipient_id = tg_id if in_remind_lesson else int(task["assigned_to_id"])
+    recipient_name = "себе (тренажёр)" if in_remind_lesson else task["assigned_to_name"]
+
     try:
         await ctx.bot.send_message(
-            int(task["assigned_to_id"]),
+            recipient_id,
             f"🔔 Напоминание от {sender['full_name']}!\n\n"
             f"<b>{task['title']}</b>\n"
             f"Срок: {fmt_dl(task['deadline'])}\n"
@@ -3415,10 +3451,15 @@ async def cb_remind_task_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"/done {tid} — отметить выполненной",
             parse_mode="HTML"
         )
-        await query.message.reply_text(f"✅ Напомнила {task['assigned_to_name']} о задаче «{task['title']}».")
+        await query.message.reply_text(f"✅ Напомнила {recipient_name} о задаче «{task['title']}».")
     except Exception as ex:
         logger.warning(f"remind_task_send: {ex}")
         await query.message.reply_text("❌ Не удалось отправить напоминание.")
+
+    if in_remind_lesson:
+        learn_kb = pop_learning_continue_keyboard(tg_id)
+        if learn_kb:
+            await query.message.reply_text("Готово, идём дальше:", reply_markup=learn_kb)
 
 async def cb_recover_period_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Выбор периода для восстановления задач из планов."""
@@ -3921,6 +3962,12 @@ async def cb_export_period(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         document=InputFile(buf, filename=filename),
         caption=f"📥 Отчёт за {label}" + (f", отдел «{dept_filter}»" if dept_filter else ", все отделы")
     )
+
+    tg_id = query.from_user.id
+    if _learning_in_progress.get(tg_id) == "export":
+        learn_kb = pop_learning_continue_keyboard(tg_id)
+        if learn_kb:
+            await query.message.reply_text("Готово, идём дальше:", reply_markup=learn_kb)
 
 async def cb_dynamics_dept(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Динамика выполнения задач по неделям — текстовый спарклайн за последние 4 недели."""
@@ -4427,6 +4474,7 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_eod_channel,         pattern="^eodchannel_"))
     app.add_handler(CallbackQueryHandler(cb_eod_extra_yes,       pattern="^eod_extra_yes$"))
     app.add_handler(CallbackQueryHandler(cb_eod_extra_no,        pattern="^eod_extra_no$"))
+    app.add_handler(CallbackQueryHandler(cb_noop,                 pattern="^noop$"))
     app.add_handler(CallbackQueryHandler(cb_back_main,           pattern="^back_main$"))
     app.add_handler(CallbackQueryHandler(cb_tasks_today,         pattern="^tasks_today$"))
     app.add_handler(CallbackQueryHandler(cb_show_all_tasks,      pattern="^show_all_tasks$"))
