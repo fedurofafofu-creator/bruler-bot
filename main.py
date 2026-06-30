@@ -296,6 +296,23 @@ def emp_set_role(tg_id, role: str):
             return True
     return False
 
+def emp_delete(tg_id) -> bool:
+    """
+    Удаляет сотрудника из листа employees. Его прошлые задачи, планы и
+    отчёты в других листах НЕ удаляются — остаются для истории/отчётности,
+    но сам человек больше не появится в emp_employees(), не получит
+    автоматических напоминаний и не сможет пользоваться ботом без повторной
+    регистрации через /start.
+    """
+    ws = emp_sheet()
+    records = safe_records(ws, EMP_H)
+    for i, r in enumerate(records, start=2):
+        if str(r["tg_id"]) == str(tg_id):
+            ws.delete_rows(i)
+            invalidate_cache("employees")
+            return True
+    return False
+
 def emp_set_founder_digest_pref(tg_id, pref: str):
     """pref: 'manual' (только заходит сам), 'digest' (только авторассылка),
     'both' (и то, и другое)."""
@@ -368,6 +385,24 @@ def today_date():
 
 def today_str():
     return datetime.now(TZ).strftime("%Y-%m-%d")
+
+_DEADLINE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+def is_overdue(deadline: str, today: str = None) -> bool:
+    """
+    Безопасная проверка 'дедлайн в прошлом', устойчивая к неправильному
+    формату даты. Прямое сравнение строк (deadline < today) ломается, если
+    где-то в таблице дедлайн оказался не в формате ГГГГ-ММ-ДД (например
+    ДД.ММ.ГГГГ после ручной правки в Google Sheets) — тогда дальняя дата в
+    неверном формате может "проиграть" сегодняшней по первому символу и
+    ошибочно посчитаться просроченной. Если формат не распознан — задача
+    НЕ считается просроченной (безопасный отказ, не ложная просрочка).
+    """
+    if not deadline or not _DEADLINE_RE.match(deadline):
+        return False
+    if today is None:
+        today = today_str()
+    return deadline < today
 
 def save_plan(tg_id, name, text):
     plans_sheet().append_row([today_str(), tg_id, name, text,
@@ -525,6 +560,7 @@ COMMAND_REGISTRY = [
             ("/setdept", "сменить отдел сотрудника"),
             ("/setshift", "назначить график (стандартный/сдвинутый)"),
             ("/recovertasks", "восстановить задачи из планов"),
+            ("/deleteuser", "удалить сотрудника из команды"),
             ("/testdigest", "диагностика отправки сводки в группу"),
             ("/fixname", "исправить имя сотрудника"),
             ("/fixallnames", "нормализовать все имена"),
@@ -920,7 +956,7 @@ def tasks_for_user(tg_id):
     """Не фильтрует тренажёрные задачи — используется в /mytasks, где сотрудник
     должен видеть свои тестовые задачи во время прохождения обучения."""
     return [r for r in tasks_all()
-            if str(r["assigned_to_id"]) == str(tg_id) and r["status"] not in ("done",)]
+            if str(r["assigned_to_id"]) == str(tg_id) and r["status"] not in ("done", "cancelled")]
 
 def tasks_overdue_for_user(tg_id):
     """Просроченные задачи конкретного сотрудника (не done, дедлайн в прошлом).
@@ -928,7 +964,7 @@ def tasks_overdue_for_user(tg_id):
     статус старых просрочек прежде чем плодить новые задачи поверх них."""
     today = today_str()
     return [r for r in tasks_for_user(tg_id)
-            if r.get("deadline","") and r["deadline"] < today]
+            if is_overdue(r.get("deadline",""), today)]
 
 def tasks_open():
     return [r for r in tasks_all_real() if r["status"] in ("open","in_progress","paused")]
@@ -936,15 +972,15 @@ def tasks_open():
 def tasks_overdue():
     today = today_str()
     return [r for r in tasks_all_real()
-            if r["status"] not in ("done",) and r.get("deadline","") and r["deadline"] < today]
+            if r["status"] not in ("done", "cancelled") and is_overdue(r.get("deadline",""), today)]
 
 def tasks_due_tomorrow():
     tmr = (today_date() + timedelta(days=1)).strftime("%Y-%m-%d")
-    return [r for r in tasks_all_real() if r.get("deadline") == tmr and r["status"] != "done"]
+    return [r for r in tasks_all_real() if r.get("deadline") == tmr and r["status"] not in ("done", "cancelled")]
 
 def tasks_due_today_list():
     return [r for r in tasks_all_real()
-            if r.get("deadline") == today_str() and r["status"] != "done"]
+            if r.get("deadline") == today_str() and r["status"] not in ("done", "cancelled")]
 
 def task_find_row(tid):
     for i, r in enumerate(safe_records(tasks_sheet(), TH), start=2):
@@ -1006,14 +1042,18 @@ def task_update_deadline(tid, deadline: str):
 def tasks_today_for_user(tg_id):
     """Все активные задачи пользователя для EOD-опроса: задачи с дедлайном сегодня
     ИЛИ просроченные ИЛИ длительные (дедлайн в будущем, но уже в работе/приостановлены).
-    Это даёт промежуточный статус каждый вечер даже для многодневных задач."""
+    Это даёт промежуточный статус каждый вечер даже для многодневных задач.
+    Задачи со статусом 'cancelled' исключены навсегда — это и есть весь смысл
+    статуса 'Отменено/Не актуально': один раз отмечена, больше не появляется
+    в опросе (в отличие от 'Не начато', которая продолжает спрашиваться
+    каждый вечер, пока не закрыта)."""
     today = today_str()
     return [r for r in tasks_all()
             if str(r["assigned_to_id"]) == str(tg_id)
-            and r["status"] != "done"
+            and r["status"] not in ("done", "cancelled")
             and (
                 r.get("deadline","") == today           # дедлайн сегодня
-                or r.get("deadline","") < today          # просрочена
+                or is_overdue(r.get("deadline",""), today)  # просрочена
                 or r["status"] in ("in_progress", "paused")  # длительная, уже стартовала
             )]
 
@@ -1429,6 +1469,9 @@ def status_keyboard(task_id: str) -> InlineKeyboardMarkup:
             InlineKeyboardButton("⏸ Приостановлено", callback_data=f"eods_paused_{task_id}"),
             InlineKeyboardButton("⬜ Не начато",      callback_data=f"eods_open_{task_id}"),
         ],
+        [
+            InlineKeyboardButton("🚫 Отменено / Не актуально", callback_data=f"eods_cancelled_{task_id}"),
+        ],
     ])
 
 async def start_eod_flow(bot: Bot, tg_id: int, training_task_ids=None):
@@ -1457,6 +1500,15 @@ async def start_eod_flow(bot: Bot, tg_id: int, training_task_ids=None):
                 reply_markup=learn_kb)
         except Exception as e:
             logger.warning(f"eod no tasks {tg_id}: {e}")
+        return
+
+    if tg_id in _eod_state:
+        # У человека уже есть активная EOD-сессия (например, он отвечает на
+        # статусы, а тут параллельно сработал автоматический job или повторное
+        # нажатие /endday) — не перезаписываем её новой пустой, иначе
+        # накопленные results теряются и в конце получается 'Выполнено 0 из 0'
+        # хотя реально было отмечено несколько задач.
+        logger.info(f"start_eod_flow: session already active for {tg_id}, skipping re-init")
         return
 
     _eod_state[tg_id] = {
@@ -1503,7 +1555,8 @@ async def cb_eod_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "done": "✅ Выполнено",
         "in_progress": "🔄 В работе",
         "paused": "⏸ Приостановлено",
-        "open": "⬜ Не начато"
+        "open": "⬜ Не начато",
+        "cancelled": "🚫 Отменено"
     }
     label = status_labels.get(status, status)
 
@@ -1511,6 +1564,35 @@ async def cb_eod_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         query.message.text + f"\n\n<b>Статус: {label}</b>",
         parse_mode="HTML"
     )
+
+    if status == "cancelled":
+        # Отменённая задача не требует канала/комментария — сразу к следующей.
+        eod["current_idx"] += 1
+        idx = eod["current_idx"]
+        if idx < len(eod["tasks"]):
+            next_task = eod["tasks"][idx]
+            await query.message.reply_text(
+                f"Задача {idx+1}/{len(eod['tasks'])}:\n<b>{next_task['title']}</b>\n\nВыбери статус:",
+                parse_mode="HTML",
+                reply_markup=status_keyboard(next_task["task_id"])
+            )
+        else:
+            await ask_extra_tasks(query.message, ctx, tg_id)
+        return
+
+    task = task_by_id(task_id)
+    if task and task.get("channel"):
+        # Канал уже проставлен раньше (например, у длительной задачи,
+        # которая проходит через EOD не первый раз) — не спрашиваем снова,
+        # одного запроса на задачу достаточно. Сразу переходим к комментарию.
+        ctx.bot_data.setdefault("eod_pending_comment", {})[tg_id] = task_id
+        await query.message.reply_text(
+            f"💬 Комментарий по задаче:\n<b>{eod['tasks'][eod['current_idx']]['title']}</b>\n\n"
+            "Опиши результат / причину статуса.\n"
+            "Если есть документ — прикрепи ссылку в конце через пробел или с новой строки.",
+            parse_mode="HTML"
+        )
+        return
 
     # Сразу предлагаем выбрать канал продаж — без отдельного текстового комментария
     keyboard = InlineKeyboardMarkup([
@@ -1631,10 +1713,17 @@ async def recv_eod_extra(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     items = parse_plan_items(text)
     u = emp_by_id(tg_id)
 
+    eod = _eod_state.get(tg_id)
     for item, item_deadline in items:
         tid = task_create(tg_id, u["full_name"], tg_id, u["full_name"],
                           item, item_deadline, source="extra")
         task_update_status(tid, "done")
+        # Без этой строки задачи сверх плана создавались и закрывались, но
+        # никогда не попадали в eod['results'] — finish_eod считал только
+        # исходный план, и счётчик 'Выполнено X из Y' полностью игнорировал
+        # дополнительно добавленные задачи, даже если все они выполнены.
+        if eod is not None:
+            eod["results"].append({"task_id": tid, "status": "done"})
 
     await update.message.reply_text(f"✅ Добавлено ещё {len(items)} выполненных задач.")
     await finish_eod(update.message, ctx, tg_id)
@@ -1702,6 +1791,9 @@ async def cmd_eod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await start_eod_flow(ctx.bot, tg_id, training_task_ids=demo_ids)
         return
 
+    # Та же защита от утечки состояния, что в cmd_endday — иначе застрявший
+    # флаг обучения мог бы заставить finish_eod принять настоящий EOD за тренажёр.
+    _learning_in_progress.pop(tg_id, None)
     await start_eod_flow(ctx.bot, tg_id)
 
 async def cmd_startday(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1712,7 +1804,15 @@ async def cmd_startday(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     не по единому времени для всех).
     """
     if update.callback_query:
-        await update.callback_query.answer()
+        try:
+            await update.callback_query.answer()
+        except Exception as ex:
+            # Telegram отклоняет answer() для callback_query старше нескольких
+            # минут ('Query is too old'). Без этого try/except исключение
+            # уходило бы наружу до выполнения остальной логики — кнопка
+            # оставалась в состоянии 'Загрузка...' навсегда, хотя реальное
+            # действие (отметка старта дня) могло бы пройти штатно дальше.
+            logger.warning(f"startday answer expired: {ex}")
         # Кнопка 'Попробовать /startday' из карточки обучения зарегистрирована
         # как прямая точка входа в ConversationHandler (см. main()), минуя
         # cb_learn_try целиком — поэтому mark_learning_action там никогда не
@@ -1725,7 +1825,14 @@ async def cmd_startday(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not emp_registered(tg_id):
         await update.effective_message.reply_text("Сначала /start"); return ConversationHandler.END
     u = emp_by_id(tg_id)
-    marked = workday_mark_start(tg_id, u["full_name"])
+    try:
+        marked = workday_mark_start(tg_id, u["full_name"])
+    except Exception as ex:
+        logger.error(f"workday_mark_start failed for {tg_id}: {ex}")
+        await update.effective_message.reply_text(
+            "⚠️ Не получилось записать начало дня — проблема с таблицей. Попробуй ещё раз через минуту."
+        )
+        return ConversationHandler.END
 
     if not marked:
         # День уже был отмечен раньше — это нормально, если человек реально
@@ -1792,6 +1899,15 @@ async def cmd_endday(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 reply_markup=learn_kb
             )
         return
+
+    # Защита от утечки состояния: если человек раньше начинал, но не
+    # завершил урок 'Как закрыть день' (бросил обучение на середине), флаг
+    # _learning_in_progress[tg_id] == 'eod' мог остаться висеть навсегда —
+    # pop_learning_continue_keyboard вызывается только при завершении урока.
+    # Без явной очистки здесь finish_eod увидел бы этот старый флаг и принял
+    # бы настоящее закрытие дня за тренажёр, тихо не сохранив реальный отчёт.
+    _learning_in_progress.pop(tg_id, None)
+
     await start_eod_flow(ctx.bot, tg_id)
 
 # ── /task ─────────────────────────────────────────────────────────────────────
@@ -2020,7 +2136,7 @@ async def cmd_changestatus(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not my_tasks:
         await update.effective_message.reply_text("У тебя нет активных задач."); return
     buttons = []
-    sl = {"open":"⬜","in_progress":"🔄","paused":"⏸"}
+    sl = {"open":"⬜","in_progress":"🔄","paused":"⏸","cancelled":"🚫"}
     for t in my_tasks[:30]:
         icon = sl.get(t["status"], "⚪")
         label = f"{icon} {t['title'][:38]}" + ("…" if len(t['title']) > 38 else "")
@@ -2062,6 +2178,9 @@ async def cb_changestatus_task_pick(update: Update, ctx: ContextTypes.DEFAULT_TY
             InlineKeyboardButton("⏸ Приостановлено", callback_data=f"chstatus_paused_{tid}"),
             InlineKeyboardButton("⬜ Не начато",      callback_data=f"chstatus_open_{tid}"),
         ],
+        [
+            InlineKeyboardButton("🚫 Отменено / Не актуально", callback_data=f"chstatus_cancelled_{tid}"),
+        ],
     ])
     await query.message.reply_text(
         f"Новый статус для:\n<b>{task['title']}</b>",
@@ -2086,7 +2205,7 @@ async def cb_changestatus_apply(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     task_update_status(task_id, status)
     status_labels = {
         "done": "✅ Выполнено", "in_progress": "🔄 В работе",
-        "paused": "⏸ Приостановлено", "open": "⬜ Не начато"
+        "paused": "⏸ Приостановлено", "open": "⬜ Не начато", "cancelled": "🚫 Отменено"
     }
     label = status_labels.get(status, status)
     await query.answer(f"Статус: {label}")
@@ -2105,7 +2224,7 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not task:
         await update.effective_message.reply_text("❌ Не найдена."); return
     sl = {"open":"⬜ Не начато","in_progress":"🔄 В работе",
-          "done":"✅ Выполнена","overdue":"🔴 Просрочена","paused":"⏸ Приостановлено"}
+          "done":"✅ Выполнена","overdue":"🔴 Просрочена","paused":"⏸ Приостановлено","cancelled":"🚫 Отменено"}
     dl = task["deadline"]
     dl_fmt = dl[8:]+"."+dl[5:7]+"."+dl[:4] if dl else "—"
     link_line = ""
@@ -2140,7 +2259,7 @@ async def cmd_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     my_tasks = tasks_for_user(tg_id)
     all_t = tasks_all()
     created_by_me = [t for t in all_t if str(t["created_by_id"]) == str(tg_id)
-                     and t["status"] != "done" and t["task_id"] not in {x["task_id"] for x in my_tasks}]
+                     and t["status"] not in ("done", "cancelled") and t["task_id"] not in {x["task_id"] for x in my_tasks}]
     editable = my_tasks + created_by_me
     if not editable:
         await update.effective_message.reply_text("Нет задач, доступных для редактирования."); return
@@ -2320,7 +2439,7 @@ async def cmd_mytasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not tasks:
         await update.effective_message.reply_text(f"{streak_line}✅ Нет активных задач!", parse_mode="HTML")
         return
-    sl = {"open":"⬜","in_progress":"🔄","paused":"⏸","overdue":"🔴"}
+    sl = {"open":"⬜","in_progress":"🔄","paused":"⏸","overdue":"🔴","cancelled":"🚫"}
     lines = [f"{streak_line}📋 <b>Твои задачи:</b>\n"] if streak_line else ["📋 <b>Твои задачи:</b>\n"]
     for t in tasks:
         dl = t["deadline"]
@@ -2395,6 +2514,9 @@ def build_admin_keyboard():
         ],
         [
             InlineKeyboardButton("📣 Разослать новое обучение", callback_data="notify_learning_pick"),
+        ],
+        [
+            InlineKeyboardButton("🗑 Удалить пользователя", callback_data="deleteuser_init"),
         ],
     ]
     return InlineKeyboardMarkup(rows)
@@ -2519,7 +2641,7 @@ def dept_filter_for(query) -> str:
     return emp_managed_dept(query.from_user.id)
 
 def tasks_for_date(target_date: str) -> list:
-    return [t for t in tasks_all_real() if t.get("deadline","") == target_date and t["status"] != "done"]
+    return [t for t in tasks_all_real() if t.get("deadline","") == target_date and t["status"] not in ("done", "cancelled")]
 
 # ── ADMIN COMMANDS ────────────────────────────────────────────────────────────
 async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2857,6 +2979,65 @@ async def cb_setshiftval_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     emp = emp_by_id(int(target_tg_id))
     label = "Стандартный (10:00–19:00)" if code == "standard" else "Сдвинутый (11:00–22:00)"
     await query.edit_message_text(f"✅ {emp['full_name']}: график «{label}»")
+
+async def cmd_deleteuser(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    /deleteuser — диалоговый выбор сотрудника кнопками, с явным подтверждением
+    перед удалением (деструктивная операция — нужна защита от случайного
+    нажатия). История задач/планов/отчётов человека не удаляется, остаётся
+    для отчётности.
+    """
+    if update.callback_query:
+        await update.callback_query.answer()
+    if not emp_is_admin(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ Только для администраторов."); return
+    emps = emp_employees()
+    if not emps:
+        await update.effective_message.reply_text("Нет зарегистрированных сотрудников."); return
+    buttons = []
+    row = []
+    for e in emps:
+        row.append(InlineKeyboardButton(e["full_name"], callback_data=f"deluser_pick_{e['tg_id']}"))
+        if len(row) == 2:
+            buttons.append(row); row = []
+    if row: buttons.append(row)
+    await update.effective_message.reply_text(
+        "Кого удалить из команды?",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+async def cb_deluser_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Выбран сотрудник — запрашиваем явное подтверждение перед удалением."""
+    query = update.callback_query; await query.answer()
+    if not emp_is_admin(query.from_user.id):
+        await query.answer("⛔ Только для администраторов.", show_alert=True); return
+    target_tg_id = query.data.replace("deluser_pick_", "", 1)
+    emp = emp_by_id(int(target_tg_id))
+    if not emp:
+        await query.message.reply_text("Сотрудник не найден."); return
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Да, удалить", callback_data=f"deluser_confirm_{target_tg_id}")],
+        [InlineKeyboardButton("◀️ Отмена", callback_data="back_main")],
+    ])
+    await query.message.reply_text(
+        f"⚠️ Удалить {emp['full_name']} из команды?\n\n"
+        f"Человек больше не сможет пользоваться ботом без повторной регистрации. "
+        f"Его прошлые задачи, планы и отчёты останутся в таблицах для истории.",
+        reply_markup=keyboard
+    )
+
+async def cb_deluser_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Подтверждено — удаляем сотрудника."""
+    query = update.callback_query; await query.answer("Удалено")
+    if not emp_is_admin(query.from_user.id):
+        await query.answer("⛔ Только для администраторов.", show_alert=True); return
+    target_tg_id = query.data.replace("deluser_confirm_", "", 1)
+    emp = emp_by_id(int(target_tg_id))
+    name = emp["full_name"] if emp else target_tg_id
+    if emp_delete(int(target_tg_id)):
+        await query.edit_message_text(f"✅ {name} удалён(а) из команды.")
+    else:
+        await query.edit_message_text("❌ Не удалось удалить — сотрудник не найден.")
 
 async def cmd_fixname(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/fixname @username Имя Фамилия — вручную исправить порядок имени/фамилии."""
@@ -3270,6 +3451,14 @@ async def cb_overdue_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if len(over) > 20:
         await query.message.reply_text(f"… и ещё {len(over)-20}. Используй 📥 Экспорт отдела для полного списка.")
 
+    notify_kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("📨 Попросить команду актуализировать", callback_data="overdue_notify_team"),
+    ]])
+    await query.message.reply_text(
+        "Хочешь, чтобы каждый сам обновил статус своих просроченных задач?",
+        reply_markup=notify_kb
+    )
+
 async def cb_overdue_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Закрыть просроченную задачу прямо из списка."""
     query = update.callback_query; await query.answer("✅ Закрыто")
@@ -3307,6 +3496,49 @@ async def cb_overdue_set_deadline(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         f"📅 Перенесено на {fmt_dl(new_deadline)}:\n{task['title'] if task else tid}",
         parse_mode="HTML"
     )
+
+async def cb_overdue_notify_team(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    Массовая актуализация: каждому сотруднику с просроченными задачами
+    приходит личное сообщение со списком ЕГО просроченных задач, каждая —
+    с кнопкой выбора актуального статуса. Переиспользует тот же безопасный
+    путь смены статуса, что /changestatus (chstatustask_), где уже проверено,
+    что менять статус может только исполнитель или admin — никаких новых
+    прав создавать не нужно.
+    """
+    query = update.callback_query; await query.answer("📨 Рассылаю...")
+    if not is_admin_check(query): return
+    dept_filter = dept_filter_for(query)
+    over = tasks_overdue()
+    if dept_filter:
+        over = [t for t in over if get_dept(t["assigned_to_id"]) == dept_filter]
+    if not over:
+        await query.message.reply_text("✅ Нет просроченных задач — рассылать некому."); return
+
+    by_assignee = {}
+    for t in over:
+        by_assignee.setdefault(t["assigned_to_id"], []).append(t)
+
+    sent = 0
+    for assignee_id, tasks in by_assignee.items():
+        try:
+            buttons = []
+            for t in tasks[:15]:
+                label = f"{t['title'][:38]}" + ("…" if len(t['title']) > 38 else "") + f" (до {fmt_dl(t['deadline'])})"
+                buttons.append([InlineKeyboardButton(label, callback_data=f"chstatustask_{t['task_id']}")])
+            overflow = f"\n…и ещё {len(tasks)-15}, используй /changestatus" if len(tasks) > 15 else ""
+            await ctx.bot.send_message(
+                int(assignee_id),
+                f"⚠️ <b>Актуализируй статус по просроченным задачам ({len(tasks)}):</b>\n"
+                f"Запросил(а): {emp_by_id(query.from_user.id)['full_name']}{overflow}",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(buttons)
+            )
+            sent += 1
+        except Exception as ex:
+            logger.warning(f"overdue_notify_team {assignee_id}: {ex}")
+
+    await query.message.reply_text(f"📨 Разослано {sent} сотрудникам ({len(over)} задач всего).")
 
 async def cb_notify_learning_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Admin видит, у каких сценариев есть непройденные версии в команде,
@@ -3545,7 +3777,7 @@ async def cb_tasks_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         lines.append(f"🔵 <b>На сегодня ({len(tasks)}):</b>")
         for t in tasks[:SHOW_LIMIT]:
             src = " <i>(план)</i>" if t.get("source") == "plan" else ""
-            sl = {"open":"⬜","in_progress":"🔄","paused":"⏸","done":"✅"}
+            sl = {"open":"⬜","in_progress":"🔄","paused":"⏸","done":"✅","cancelled":"🚫"}
             icon = sl.get(t["status"],"🔵")
             lines.append(f"  {icon} <code>{t['task_id']}</code> {t['assigned_to_name']}: {t['title']}{src}")
         if len(tasks) > SHOW_LIMIT:
@@ -3608,7 +3840,7 @@ async def cb_summary_depts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         planned   = sum(1 for e in emps if str(e["tg_id"]) in plan_ids)
         overdue_c = sum(1 for t in all_t
                         if get_dept(t["assigned_to_id"]) == dept
-                        and t["status"] != "done" and t.get("deadline","") < today)
+                        and t["status"] not in ("done", "cancelled") and is_overdue(t.get("deadline",""), today))
         icon = "✅" if submitted == len(emps) else ("🟡" if submitted > 0 else "🔴")
         lines.append(f"{icon} <b>{dept}</b> ({len(emps)} чел.)")
         lines.append(f"  планов {planned}/{len(emps)}  EOD закрыт {submitted}/{len(emps)}"
@@ -3714,11 +3946,11 @@ async def cb_summary_person(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     plan_ids   = {str(p["tg_id"]) for p in plans_today()}
     report_ids = {str(r["tg_id"]) for r in reports_today()}
     all_t = tasks_all_real()
-    emp_tasks = [t for t in all_t if str(t["assigned_to_id"]) == tg_id and t["status"] != "done"]
+    emp_tasks = [t for t in all_t if str(t["assigned_to_id"]) == tg_id and t["status"] not in ("done", "cancelled")]
     done_today = [t for t in all_t if str(t["assigned_to_id"]) == tg_id
                   and t["status"] == "done" and t.get("done_at","").startswith(today)]
-    overdue = [t for t in emp_tasks if t.get("deadline","") < today]
-    sl = {"open":"⬜","in_progress":"🔄","paused":"⏸","done":"✅"}
+    overdue = [t for t in emp_tasks if is_overdue(t.get("deadline",""), today)]
+    sl = {"open":"⬜","in_progress":"🔄","paused":"⏸","done":"✅","cancelled":"🚫"}
     lines = [
         f"👤 <b>{emp['full_name']}</b>  ({get_dept(tg_id)})",
         f"Сегодня {today_fmt}:  план {'✅' if tg_id in plan_ids else '❌'}  EOD {'✅' if tg_id in report_ids else '❌'}\n",
@@ -3925,7 +4157,7 @@ def build_export_workbook(dept_filter: str, period: str):
         c.fill = header_fill
         c.alignment = Alignment(horizontal="center")
 
-    status_labels = {"open":"Не начато","in_progress":"В работе","paused":"Приостановлено","done":"Выполнено"}
+    status_labels = {"open":"Не начато","in_progress":"В работе","paused":"Приостановлено","done":"Выполнено","cancelled":"Отменено"}
     link_col_idx = headers.index("Ссылка") + 1 if "Ссылка" in headers else None
     for t in rows:
         ws.append([
@@ -4074,6 +4306,8 @@ async def job_check_workday_end(bot: Bot):
             continue
 
         try:
+            # Та же защита от утечки состояния обучения, что в cmd_eod/cmd_endday.
+            _learning_in_progress.pop(tg_id, None)
             await start_eod_flow(bot, tg_id)
             _endday_reminder_count[key] = count + 1
         except Exception as ex:
@@ -4357,6 +4591,7 @@ async def post_init(app):
         ("checkstatuses", "Запросить статусы у команды/отдела прямо сейчас"),
         ("learningreport", "Прогресс обучения команды"),
         ("recovertasks", "Восстановить пропавшие задачи из планов: /recovertasks [дней]"),
+        ("deleteuser", "Удалить сотрудника из команды"),
         ("makeadmin", "Стать администратором"),
         ("setdepthead", "Назначить руководителя отдела: /setdepthead @username"),
         ("setfounder", "Назначить учредителя: /setfounder @username"),
@@ -4430,6 +4665,7 @@ def main():
     app.add_handler(CommandHandler("setfounder", cmd_setfounder))
     app.add_handler(CommandHandler("setdept", cmd_setdept))
     app.add_handler(CommandHandler("setshift", cmd_setshift))
+    app.add_handler(CommandHandler("deleteuser", cmd_deleteuser))
     app.add_handler(CommandHandler("fixsheets", cmd_fixsheets))
     app.add_handler(CommandHandler("fixname", cmd_fixname))
     app.add_handler(CommandHandler("fixallnames", cmd_fixallnames))
@@ -4465,6 +4701,9 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_setdeptemp_pick,     pattern="^setdeptemp_"))
     app.add_handler(CallbackQueryHandler(cb_setshiftemp_pick,    pattern="^setshiftemp_"))
     app.add_handler(CallbackQueryHandler(cb_setshiftval_pick,    pattern="^setshiftval_"))
+    app.add_handler(CallbackQueryHandler(cmd_deleteuser,          pattern="^deleteuser_init$"))
+    app.add_handler(CallbackQueryHandler(cb_deluser_pick,        pattern="^deluser_pick_"))
+    app.add_handler(CallbackQueryHandler(cb_deluser_confirm,     pattern="^deluser_confirm_"))
     app.add_handler(CallbackQueryHandler(cb_donetask_pick,       pattern="^donetask_"))
     app.add_handler(CallbackQueryHandler(cb_changestatus_task_pick, pattern="^chstatustask_"))
     app.add_handler(CallbackQueryHandler(cb_changestatus_apply,     pattern="^chstatus_"))
@@ -4493,6 +4732,7 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_overdue_done,         pattern="^overduedone_"))
     app.add_handler(CallbackQueryHandler(cb_overdue_move_pick,    pattern="^overduemove_"))
     app.add_handler(CallbackQueryHandler(cb_overdue_set_deadline, pattern="^overduesetdl_"))
+    app.add_handler(CallbackQueryHandler(cb_overdue_notify_team,  pattern="^overdue_notify_team$"))
     app.add_handler(CallbackQueryHandler(cb_remind_task_pick,    pattern="^remind_task_pick$"))
     app.add_handler(CallbackQueryHandler(cb_remind_task_send,    pattern="^remindtask_"))
     app.add_handler(CallbackQueryHandler(cb_recover_period_pick, pattern="^recover_period_pick$"))
